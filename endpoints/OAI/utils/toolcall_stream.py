@@ -268,6 +268,14 @@ class QwenToolCallDeltaStreamer:
                 self._sent = ""
                 self._state = self._VALUE
 
+        # Some values cannot be streamed until their closing parameter tag
+        # because they may be coerced into JSON (objects, arrays, numbers,
+        # booleans, quoted strings). Keep OpenAI-compatible agent watchdogs
+        # alive during those long values with an empty argument fragment. It
+        # is a valid no-op when clients concatenate argument deltas.
+        if not deltas and self.emitted and self._in_func:
+            deltas.append({"index": self._index, "function": {"arguments": ""}})
+
         return deltas
 
     # -- value handling
@@ -318,6 +326,19 @@ class QwenToolCallDeltaStreamer:
         self._raw = ""
         self._streaming = False
         self._sent = ""
+
+    @property
+    def complete(self) -> bool:
+        """Whether every opened call closed into valid JSON arguments."""
+
+        if not self.emitted or self._in_func or self._state == self._VALUE:
+            return False
+        if not self._names or len(self._names) != len(self._assembled):
+            return False
+        try:
+            return all(isinstance(json.loads(arguments), dict) for arguments in self._assembled)
+        except (TypeError, ValueError):
+            return False
 
     # -- end-of-stream cross-check
 

@@ -151,8 +151,26 @@ class StreamingDeltaWiringTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse([f for f in frames if f.get("delta_tool_calls")])
         final = frames[-1]
-        self.assertEqual(final["finish_reason"], "tool_calls")
+        self.assertEqual(final["finish_reason"], "length")
         self.assertEqual(final["delta_tool_calls"], [])  # authoritative parse: none
+
+    async def test_truncated_call_is_not_reported_as_executable(self):
+        incomplete = TC_S + "<function=write_file><parameter=content>unfinished"
+        mc = make_mc(pieces(RS + RE + incomplete))
+
+        frames, _ = await run_collector(mc, make_request())
+
+        self.assertTrue([f for f in frames if f.get("delta_tool_calls")])
+        self.assertEqual(frames[-1]["finish_reason"], "length")
+
+    async def test_non_streaming_truncated_call_finishes_length(self):
+        incomplete = TC_S + "<function=write_file><parameter=content>unfinished"
+        mc = make_mc(pieces(RS + RE + incomplete))
+
+        _, result = await run_collector(mc, make_request(), streaming=False)
+
+        self.assertEqual(result["tool_calls"], [])
+        self.assertEqual(result["finish_reason"], "length")
 
     async def test_tool_choice_none_keeps_old_path(self):
         chunks = pieces(RS + "thinking" + RE) + pieces(tool_text())

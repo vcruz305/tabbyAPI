@@ -220,6 +220,35 @@ class QwenToolCallDeltaStreamerTests(ToolCallContractMixin, unittest.TestCase):
         self.assert_matches(func("scale", [("replicas", "\n42\n")]), expect_calls=1)
         self.assert_matches(func("toggle", [("flag", "\ntrue\n")]), expect_calls=1)
 
+    def test_buffered_json_value_emits_noop_progress(self):
+        # Object/array/number-like values are held until parameter close so
+        # coerce_param_value can preserve their type. They must still produce
+        # progress frames so agent watchdogs do not time out on long payloads.
+        streamer = QwenToolCallDeltaStreamer()
+        prefix = f"{TC_S}{LT}function=write_file{GT}{LT}parameter=content{GT}{{"
+        middle = '"key": "a long value"'
+        suffix = f"}}{LT}/parameter{GT}{LT}/function{GT}{TC_E}"
+
+        frames = [streamer.feed(prefix)]
+        progress = streamer.feed(middle)
+        frames.append(progress)
+        frames.append(streamer.feed(suffix))
+
+        self.assertEqual(progress, [{"index": 0, "function": {"arguments": ""}}])
+        self.assertTrue(streamer.complete)
+        assembled = "".join(
+            delta["function"].get("arguments", "")
+            for frame in frames
+            for delta in frame
+        )
+        expected = qwen3_coder.parse_toolcalls(prefix + middle + suffix)[0].function.arguments
+        self.assertEqual(assembled, expected)
+
+    def test_unclosed_function_is_incomplete(self):
+        streamer = QwenToolCallDeltaStreamer()
+        streamer.feed(f"{TC_S}{LT}function=write_file{GT}{LT}parameter=content{GT}unfinished")
+        self.assertFalse(streamer.complete)
+
     def test_keyword_divergence_streams_as_string(self):
         # "the value" diverges from "true" and must stream; "neutral" too
         self.assert_matches(

@@ -780,11 +780,25 @@ async def _chat_stream_collector(
                         # calls itself, so only cross-check against the
                         # authoritative parse and close the finish reason.
                         tool_streamer.verify(full_tool, request_id)
+                        parsed_tool_output = tool_streamer.complete
                     else:
                         generation["delta_tool_calls"] = _parse_tool_calls(
                             full_tool, tool_format, request_id
                         )
-                    generation["finish_reason"] = "tool_calls"
+                        parsed_tool_output = bool(generation["delta_tool_calls"])
+                    if parsed_tool_output:
+                        generation["finish_reason"] = "tool_calls"
+                    else:
+                        # Never tell an OpenAI-compatible client to execute a
+                        # tool when no complete call was produced. `length`
+                        # signals that the structured output is incomplete and
+                        # lets an agent retry instead of treating an empty or
+                        # invalid call as a successful turn.
+                        generation["finish_reason"] = "length"
+                        xlogger.warning(
+                            f"{request_id}: incomplete or unparseable tool call; "
+                            "returning finish_reason=length"
+                        )
                 await gen_queue.put(generation)
 
             # End
@@ -799,8 +813,14 @@ async def _chat_stream_collector(
             generation["reasoning_content"] = full_reasoning
             generation["content"] = full_content if has_content else None
             generation["tool_calls"] = _parse_tool_calls(full_tool, tool_format, request_id)
-            if full_tool:
+            if generation["tool_calls"]:
                 generation["finish_reason"] = "tool_calls"
+            elif full_tool:
+                generation["finish_reason"] = "length"
+                xlogger.warning(
+                    f"{request_id}: incomplete or unparseable tool call; "
+                    "returning finish_reason=length"
+                )
             return generation
 
     except Exception as e:
