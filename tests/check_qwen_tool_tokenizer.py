@@ -92,12 +92,35 @@ def check(path, eos_text="<|im_end|>"):
         ("auto_native_message_token", xml("ping", "<|im_start|>literal"), ("ping",), True, False),
     ]
     fixtures += [("auto", *case) for case in auto_cases]
+    fixtures = [(*case, frozenset()) for case in fixtures]
+    # Closed empty object schemas must prevent invented parameters. All other
+    # function/value paths remain identical to the existing protocol above.
+    closed_cases = [
+        ("required", "closed_no_args", xml("ping"), ("ping",), False, True),
+        ("required", "closed_invented_arg", xml("ping", ""), ("ping",), False, False),
+        (
+            "required", "closed_and_open_functions", xml("ping") + xml("weather", "Paris"),
+            ("ping", "weather"), True, True,
+        ),
+        ("named", "closed_named_no_args", xml("ping"), ("ping",), False, True),
+        ("named", "closed_named_invented_arg", xml("ping", "wrong"), ("ping",), False, False),
+        ("auto", "closed_auto_no_args", xml("ping"), ("ping",), True, True),
+        ("auto", "closed_auto_invented_arg", xml("ping", ""), ("ping",), True, False),
+        ("auto", "closed_auto_bare", "<function=ping></function>", ("ping",), True, True),
+        (
+            "auto", "closed_auto_bare_invented_arg",
+            "<function=ping><parameter=__noargs></parameter></function>",
+            ("ping",), True, False,
+        ),
+        ("auto", "closed_auto_zero_calls", "READY", ("ping",), False, True),
+    ]
+    fixtures += [(*case, frozenset({"ping"})) for case in closed_cases]
     results = []
-    for mode, name, text, names, parallel, expected in fixtures:
+    for mode, name, text, names, parallel, expected, no_argument_names in fixtures:
         grammar = (
-            auto_tool_grammar(names, parallel, added_ids)
+            auto_tool_grammar(names, parallel, added_ids, no_argument_names=no_argument_names)
             if mode == "auto"
-            else ForcedToolChoice(names, parallel).grammar(added_ids)
+            else ForcedToolChoice(names, parallel, no_argument_names).grammar(added_ids)
         )
         error = LLMatcher.validate_grammar(grammar, tokenizer)
         if error:
@@ -130,6 +153,7 @@ def check(path, eos_text="<|im_end|>"):
             {
                 "case": name,
                 "tool_choice": mode,
+                "no_argument_names": sorted(no_argument_names),
                 "accepted": valid,
                 "expected": expected,
                 "tokens": len(tokens),

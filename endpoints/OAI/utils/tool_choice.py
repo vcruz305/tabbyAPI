@@ -1,7 +1,8 @@
 """Qwen tool choices backed by the existing llguidance output filter.
 
-The grammar constrains call structure, function names and call count. It does
-not claim strict JSON Schema validation of the pseudo-XML parameter values.
+The grammar constrains call structure, function names, call count and explicitly
+closed empty parameter objects. It does not claim strict JSON Schema validation
+of the pseudo-XML parameter values.
 """
 
 from dataclasses import dataclass
@@ -60,6 +61,11 @@ def literal_token_ids(tokenizer) -> dict[str, int]:
 class ForcedToolChoice:
     names: tuple[str, ...]
     parallel: bool
+    no_argument_names: frozenset[str] = frozenset()
+
+    def parameter_terms(self, name: str) -> str:
+        """A closed empty object permits no parameter tags, including invented ones."""
+        return "" if name in self.no_argument_names else "parameter* "
 
     def grammar(self, token_ids: dict[str, int] | None = None) -> str:
         token_ids = token_ids or {}
@@ -91,15 +97,21 @@ class ForcedToolChoice:
             if not literals:
                 value += "TEXT: /(?s:.*)/\n"
 
-        names = " | ".join(marker(f"<function={name}>") for name in self.names)
-        if "<function=" in token_ids:
-            tails = " | ".join(json.dumps(name + ">") for name in self.names)
-            names += f" | <[{token_ids['<function=']}]> ({tails})"
+        functions = []
+        for parameters in ("parameter* ", ""):
+            group = [name for name in self.names if self.parameter_terms(name) == parameters]
+            if not group:
+                continue
+            openers = " | ".join(marker(f"<function={name}>") for name in group)
+            if "<function=" in token_ids:
+                tails = " | ".join(json.dumps(name + ">") for name in group)
+                openers += f" | <[{token_ids['<function=']}]> ({tails})"
+            functions.append(f"({openers}) WS {parameters}{marker('</function>')}")
         repetition = " (WS tool_call)*" if self.parallel else ""
         return (
             f"start: WS tool_call{repetition} WS\n"
             f"tool_call: {marker('<tool_call>')} WS function WS {marker('</tool_call>')}\n"
-            f"function: ({names}) WS parameter* {marker('</function>')}\n"
+            f"function: {' | '.join(functions)}\n"
             f'parameter: {marker("<parameter=")} NAME ">" value WS\n'
             + value
             + "WS: /[ \\t\\r\\n]{0,8}/\n"
@@ -145,7 +157,33 @@ def _declared_tool_names(data: ChatCompletionRequest) -> tuple[str, ...]:
     return names
 
 
-def auto_tool_grammar(names: tuple[str, ...], parallel: bool, token_ids=None) -> str:
+def _closed_empty_tool_names(data: ChatCompletionRequest) -> frozenset[str]:
+    """Recognize only explicit, unambiguous zero-argument object declarations.
+
+    Empty properties alone still permit arbitrary keys in JSON Schema. Pattern
+    properties can also permit keys despite additionalProperties=false. Leave
+    those and other schema shapes on the existing unconstrained value protocol.
+    """
+    names = set()
+    for tool in data.tools or data.functions or []:
+        if hasattr(tool, "model_dump"):
+            tool = tool.model_dump()
+        function = tool.get("function", tool)
+        schema = function.get("parameters")
+        if (
+            isinstance(schema, dict)
+            and schema.get("type") == "object"
+            and schema.get("properties") == {}
+            and schema.get("additionalProperties") is False
+            and schema.get("patternProperties", {}) == {}
+        ):
+            names.add(function.get("name"))
+    return frozenset(names)
+
+
+def auto_tool_grammar(
+    names: tuple[str, ...], parallel: bool, token_ids=None, *, no_argument_names=frozenset()
+) -> str:
     """Allow free content and zero calls, then constrain every Qwen call opener.
 
     The free-content prefix states matter even for byte-tokenized openers. A
@@ -160,9 +198,16 @@ def auto_tool_grammar(names: tuple[str, ...], parallel: bool, token_ids=None) ->
         return f"({quoted} | <[{token_ids[text]}]>)" if text in token_ids else quoted
 
     # Keep the parameter/value protocol identical to forced tool_choice.
-    definitions = ForcedToolChoice(names, parallel).grammar(token_ids).split("\n", 1)[1]
-    name_tail = " | ".join(json.dumps(name + ">") for name in names)
-    definitions += f"auto_function_tail: ({name_tail}) WS parameter* {marker('</function>')}\n"
+    choice = ForcedToolChoice(names, parallel, no_argument_names)
+    definitions = choice.grammar(token_ids).split("\n", 1)[1]
+    function_tails = []
+    for parameters in ("parameter* ", ""):
+        group = [name for name in names if choice.parameter_terms(name) == parameters]
+        if not group:
+            continue
+        tails = " | ".join(json.dumps(name + ">") for name in group)
+        function_tails.append(f"({tails}) WS {parameters}{marker('</function>')}")
+    definitions += "auto_function_tail: " + " | ".join(function_tails) + "\n"
     openers = ("<tool_call>", "<function=")
     function_tokens = {
         name: token_ids[f"<function={name}>"] for name in names if f"<function={name}>" in token_ids
@@ -236,9 +281,12 @@ def auto_tool_grammar(names: tuple[str, ...], parallel: bool, token_ids=None) ->
                 for opener in openers:
                     if opener in token_ids:
                         alternatives.append(f"<[{token_ids[opener]}]> " + call_tail(opener))
-                for token_id in function_tokens.values():
+                for name, token_id in function_tokens.items():
                     alternatives.append(
-                        f"<[{token_id}]> WS parameter* " + marker("</function>") + " " + next_root
+                        f"<[{token_id}]> WS {choice.parameter_terms(name)}"
+                        + marker("</function>")
+                        + " "
+                        + next_root
                     )
             rules.append(f"auto_{seen}_{node['index']}: (" + " | ".join(alternatives) + ")?")
     return "\n".join(rules) + "\n" + definitions
@@ -268,7 +316,11 @@ def resolve_forced_tool_choice(data: ChatCompletionRequest) -> ForcedToolChoice 
             )
         names = (selected,)
 
-    return ForcedToolChoice(names, parallel=data.parallel_tool_calls is not False)
+    return ForcedToolChoice(
+        names,
+        parallel=data.parallel_tool_calls is not False,
+        no_argument_names=_closed_empty_tool_names(data).intersection(names),
+    )
 
 
 def prepare_forced_tool_choice(
@@ -290,6 +342,7 @@ def prepare_forced_tool_choice(
                 _declared_tool_names(data),
                 parallel=data.parallel_tool_calls is not False,
                 token_ids=literal_token_ids(tokenizer),
+                no_argument_names=_closed_empty_tool_names(data),
             )
         return None
     if canonical_format_name(tool_format) != "qwen3_coder":
