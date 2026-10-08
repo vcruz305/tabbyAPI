@@ -515,7 +515,11 @@ async def apply_chat_template(data: ChatCompletionRequest):
     Template stop strings can be overriden by sampler overrides if force is true.
     """
 
-    forced_choice = prepare_forced_tool_choice(data, getattr(model.container, "tool_format", None))
+    forced_choice = prepare_forced_tool_choice(
+        data,
+        getattr(model.container, "tool_format", None),
+        getattr(model.container, "tokenizer", None),
+    )
     normalize_message_roles(data)
 
     # A named choice only exposes the selected declaration to the template;

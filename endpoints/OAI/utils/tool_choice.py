@@ -24,25 +24,83 @@ def function_name(tool) -> str:
     return function.get("name", "")
 
 
+# These tags can occur literally in code even when a tokenizer marks them
+# special. Other special tokens (EOS, message boundaries, image/audio markers)
+# remain governed by the model's normal stop/control-token handling.
+_LITERAL_MARKERS = {
+    "<tool_call>",
+    "</tool_call>",
+    "<tool_response>",
+    "</tool_response>",
+    "<think>",
+    "</think>",
+}
+
+
+def literal_token_ids(tokenizer) -> dict[str, int]:
+    """Added tokens llguidance represents as token IDs instead of UTF-8 text.
+
+    This includes HF added tokens with special=False. Reading only the model's
+    special-token flags would miss Qwen's tool wrappers and reasoning markers.
+    Accept the backend tokenizer or its underlying Hugging Face tokenizer.
+    """
+
+    hf = getattr(tokenizer, "tokenizer", tokenizer)
+    decoder = getattr(hf, "get_added_tokens_decoder", None)
+    if decoder is None:
+        return {}
+    return {
+        token.content: token_id
+        for token_id, token in decoder().items()
+        if not token.special or token.content in _LITERAL_MARKERS
+    }
+
+
 @dataclass(frozen=True)
 class ForcedToolChoice:
     names: tuple[str, ...]
     parallel: bool
 
-    def grammar(self) -> str:
-        # llguidance's suffix lexeme stops at the first parameter close tag.
-        # A greedy regex with a separate close terminal would consume the
-        # close-tag prefix and dead-end instead. Other XML in a value is literal.
-        names = " | ".join(json.dumps(f"<function={name}>") for name in self.names)
+    def grammar(self, token_ids: dict[str, int] | None = None) -> str:
+        token_ids = token_ids or {}
+
+        def marker(text):
+            quoted = json.dumps(text)
+            if text in token_ids:
+                return f"({quoted} | <[{token_ids[text]}]>)"
+            return quoted
+
+        # Text uses a lazy suffix to end at the first parameter close. Added
+        # tokens interrupt text lexemes; permit literal ones between text runs.
+        # They must be grammar rules, since special token IDs cannot occur
+        # inside regex terminals. Quoted markers remain valid as normal text.
+        literals = [token_id for text, token_id in token_ids.items() if text != "</parameter>"]
+        if literals:
+            alternatives = " | ".join(f"<[{token_id}]>" for token_id in sorted(set(literals)))
+            value = "value: (TEXT special_literal)* value_end\n"
+            value += f"special_literal: {alternatives}\nTEXT: /(?s:.*)/\n"
+        else:
+            value = "value: value_end\n"
+        value += 'value_end[suffix="</parameter>"]: /(?s:.*)/\n'
+        if "</parameter>" in token_ids:
+            # A parameter delimiter can itself be an added token in compatible
+            # tokenizers. It closes the value rather than becoming literal data.
+            value = value.replace(
+                "value_end\n", f"(value_end | TEXT <[{token_ids['</parameter>']}]>)\n", 1
+            )
+            if not literals:
+                value += "TEXT: /(?s:.*)/\n"
+
+        names = " | ".join(marker(f"<function={name}>") for name in self.names)
         repetition = " (WS tool_call)*" if self.parallel else ""
         return (
             f"start: WS tool_call{repetition} WS\n"
-            'tool_call: "<tool_call>" WS function WS "</tool_call>"\n'
-            f'function: ({names}) WS parameter* "</function>"\n'
-            'parameter: "<parameter=" NAME ">" value WS\n'
-            'value[suffix="</parameter>"]: /(?s:.*)/\n'
-            "WS: /[ \\t\\r\\n]{0,8}/\n"
-            "NAME: /[^<>\\s=]+/\n"
+            f"tool_call: {marker('<tool_call>')} WS function WS {marker('</tool_call>')}\n"
+            f"function: ({names}) WS parameter* {marker('</function>')}\n"
+            f'parameter: {marker("<parameter=")} NAME ">" value WS\n'
+            + value
+            + "WS: /[ \\t\\r\\n]{0,8}/\n"
+            + "NAME: /[^<>\\s=]+/\n"
         )
 
     def validate_name(self, name: str, index: int = 0):
@@ -99,7 +157,7 @@ def resolve_forced_tool_choice(data: ChatCompletionRequest) -> ForcedToolChoice 
 
 
 def prepare_forced_tool_choice(
-    data: ChatCompletionRequest, tool_format: str | None
+    data: ChatCompletionRequest, tool_format: str | None, tokenizer=None
 ) -> ForcedToolChoice | None:
     """Validate forcing before generation and install the request's XML grammar."""
 
@@ -132,5 +190,5 @@ def prepare_forced_tool_choice(
             "response_prefix because its grammar starts at a new tool call.",
         )
 
-    data.grammar_string = choice.grammar()
+    data.grammar_string = choice.grammar(literal_token_ids(tokenizer))
     return choice

@@ -10,6 +10,7 @@ from common.errors import ToolCallParseError
 from endpoints.OAI.utils import chat_completion as cc
 from endpoints.OAI.utils.tool_choice import (
     ForcedToolChoice,
+    literal_token_ids,
     prepare_forced_tool_choice,
     resolve_forced_tool_choice,
 )
@@ -181,6 +182,89 @@ class ForcedChoiceGrammarTests(unittest.TestCase):
         text = xml("ping", [("a", "1"), ("b", "true"), ("c", "{}")])
         self.assertTrue(self.accepts(text))
         self.assertFalse(self.accepts(" " * 30 + text))
+
+
+class AddedTokenGrammarTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        try:
+            from llguidance import LLMatcher, LLTokenizer, TokenizerWrapper
+        except ImportError:
+            raise unittest.SkipTest("llguidance is required for added-token grammar tests")
+        cls.markers = [
+            "<tool_call>",
+            "</tool_call>",
+            "<think>",
+            "</think>",
+            "<tool_response>",
+            "</tool_response>",
+            "</parameter>",
+        ]
+        cls.ids = {text: i + 257 for i, text in enumerate(cls.markers)}
+        marker_bytes = {text.encode(): token_id for text, token_id in cls.ids.items()}
+
+        class AddedByteTokenizer:
+            eos_token_id = 256
+            bos_token_id = None
+            tokens = [bytes([i]) for i in range(256)] + [b"<eos>"] + list(marker_bytes)
+            special_token_ids = list(range(256, 256 + 1 + len(marker_bytes)))
+
+            def __call__(self, text):
+                raw = text if isinstance(text, bytes) else text.encode("utf-8")
+                out, pos = [], 0
+                while pos < len(raw):
+                    for marker, token_id in marker_bytes.items():
+                        if raw.startswith(marker, pos):
+                            out.append(token_id)
+                            pos += len(marker)
+                            break
+                    else:
+                        out.append(raw[pos])
+                        pos += 1
+                return out
+
+        cls.matcher = LLMatcher
+        cls.tokenizer = LLTokenizer(TokenizerWrapper(AddedByteTokenizer()), slices=[])
+
+    def accepts(self, value):
+        grammar = ForcedToolChoice(("ping",), False).grammar(self.ids)
+        self.assertEqual(self.matcher.validate_grammar(grammar, self.tokenizer), "")
+        matcher = self.matcher(self.tokenizer, grammar, log_level=0)
+        raw = xml("ping", [("code", value)])
+        return matcher.consume_tokens(self.tokenizer.tokenize_str(raw)) and matcher.is_accepting()
+
+    def test_special_wrappers_and_literal_special_tokens_in_values(self):
+        for value in [
+            "",
+            "hello",
+            "<",
+            "<<",
+            "</",
+            "</paramete> </parameterX>",
+            "<think>x</think> </function> <tool_call></tool_call>",
+            '<tool_response>{"ok":true}</tool_response>',
+            "東京 ☀️",
+        ]:
+            with self.subTest(value=value):
+                self.assertTrue(self.accepts(value))
+
+    def test_first_parameter_delimiter_cannot_be_swallowed_before_special_token(self):
+        for value in ["before</parameter>after", "before</parameter>after<think>x"]:
+            with self.subTest(value=value):
+                self.assertFalse(self.accepts(value))
+
+    def test_non_special_added_tokens_are_discovered_without_allowing_eos(self):
+        tokens = {
+            100: SimpleNamespace(content="<tool_call>", special=False),
+            101: SimpleNamespace(content="<think>", special=True),
+            102: SimpleNamespace(content="<|file_sep|>", special=False),
+            103: SimpleNamespace(content="<|im_end|>", special=True),
+        }
+        hf = SimpleNamespace(get_added_tokens_decoder=lambda: tokens)
+        expected = {"<tool_call>": 100, "<think>": 101, "<|file_sep|>": 102}
+        self.assertEqual(literal_token_ids(hf), expected)
+        self.assertEqual(literal_token_ids(SimpleNamespace(tokenizer=hf)), expected)
+        self.assertEqual(literal_token_ids(None), {})
 
 
 class ForcedChoiceTemplateTests(unittest.IsolatedAsyncioTestCase):
