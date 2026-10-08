@@ -62,6 +62,10 @@ from endpoints.OAI.utils.tool_choice import (
     prepare_forced_tool_choice,
     resolve_forced_tool_choice,
 )
+from endpoints.OAI.utils.qwen_tool_guidance import (
+    nullable_guidance_eligible,
+    with_nullable_xml_guidance,
+)
 
 
 def _start_in_reasoning_mode(prompt: str, user_suffix_len: int = 0) -> bool:
@@ -518,9 +522,11 @@ async def apply_chat_template(data: ChatCompletionRequest):
     Template stop strings can be overriden by sampler overrides if force is true.
     """
 
+    tool_format = getattr(model.container, "tool_format", None)
+    nullable_guidance = nullable_guidance_eligible(data, tool_format)
     forced_choice = prepare_forced_tool_choice(
         data,
-        getattr(model.container, "tool_format", None),
+        tool_format,
         getattr(model.container, "tokenizer", None),
     )
     normalize_message_roles(data)
@@ -534,6 +540,9 @@ async def apply_chat_template(data: ChatCompletionRequest):
             tools = [tool for tool in tools if function_name(tool) in forced_choice.names]
         if functions:
             functions = [tool for tool in functions if function_name(tool) in forced_choice.names]
+    if nullable_guidance:
+        tools = with_nullable_xml_guidance(tools)
+        functions = with_nullable_xml_guidance(functions)
 
     try:
         data.template_vars = resolve_template_vars(data, model.container)
