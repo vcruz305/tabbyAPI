@@ -143,15 +143,35 @@ def _is_loaded_model(model_name: str) -> bool:
     if not (model.container and model.container.loaded):
         return False
 
-    loaded_model_dir = model.container.model_dir
+    return _matches_model_path(model_name, model.container.model_dir)
+
+
+def _matches_model_path(model_name: str, loaded_model_dir: pathlib.Path) -> bool:
     if loaded_model_dir.name == model_name:
         return True
 
     requested_path = pathlib.Path(config.model.model_dir) / model_name
     try:
         return requested_path.resolve() == loaded_model_dir.resolve()
-    except OSError:
+    except (OSError, RuntimeError, ValueError):
         return False
+
+
+def response_model_name(requested: str | None, loaded_model_dir: pathlib.Path) -> str:
+    """Keep verified public aliases, never echo a silently ignored model name.
+
+    Inline loading can be disabled, in which case load_inline_model preserves
+    legacy behavior and ignores an unrecognized request name. Such responses
+    identify the actual loaded model. Explicitly configured dummy names are
+    intentional compatibility aliases and may still be returned.
+    """
+
+    if requested and (
+        _matches_model_path(requested, loaded_model_dir)
+        or (config.model.use_dummy_models and requested in config.model.dummy_model_names)
+    ):
+        return requested
+    return loaded_model_dir.name
 
 
 async def load_inline_model(model_name: str, request: Request):

@@ -49,7 +49,12 @@ from endpoints.OAI.utils.tools import (
     parse_toolcalls,
     supports_delta_streaming,
 )
-from endpoints.OAI.utils.common_ import aggregate_usage_stats, get_timings, get_usage_stats
+from endpoints.OAI.utils.common_ import (
+    aggregate_usage_stats,
+    get_timings,
+    get_usage_stats,
+    response_model_name,
+)
 from endpoints.OAI.utils.toolcall_stream import QwenToolCallDeltaStreamer
 from common.errors import ToolCallParseError
 from endpoints.OAI.utils.tool_choice import (
@@ -945,6 +950,7 @@ async def stream_generate_chat_completion(
     gen_queue = asyncio.Queue()
     gen_tasks: List[asyncio.Task] = []
     return_usage = data.stream_options and data.stream_options.include_usage
+    response_model = response_model_name(getattr(data, "model", None), model_path)
 
     try:
         xlogger.debug(
@@ -1002,7 +1008,7 @@ async def stream_generate_chat_completion(
             chunk, _, finish_reason, is_empty = _compose_serialize_stream_chunk(
                 request.state.id,
                 generation,
-                data.model or model_path.name,
+                response_model,
                 suppress_finish,
                 None if suppress_finish else timings,
             )
@@ -1020,7 +1026,7 @@ async def stream_generate_chat_completion(
                             aggregate_usage_stats(usage_stats_list),
                             generation["index"],
                             finish_reason,
-                            data.model or model_path.name,
+                            response_model,
                             timings,
                         )
                         yield usage_chunk
@@ -1065,6 +1071,7 @@ async def generate_chat_completion(
 ):
     gen_tasks: List[asyncio.Task] = []
     return_usage = True  # non-streaming responses always carry usage
+    response_model = response_model_name(getattr(data, "model", None), model_path)
 
     try:
         xlogger.debug(
@@ -1109,9 +1116,7 @@ async def generate_chat_completion(
             if isinstance(r, Exception):
                 raise r
             generations.append(r)
-        response = _compose_response(
-            request.state.id, generations, data.model or model_path.name, return_usage
-        )
+        response = _compose_response(request.state.id, generations, response_model, return_usage)
 
         xlogger.debug(f"{request_tag(request)} chat completion finished", {"response": response})
         return response
