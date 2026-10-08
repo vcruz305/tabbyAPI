@@ -16,11 +16,12 @@ delta fragments:
   - when a parameter closes: {index, function: {arguments: <json fragment>}}
   - when the function closes: {index, function: {arguments: "}"}}
 
-String parameter values are additionally streamed while they are generated
-(as a JSON string), as soon as it is provable that the value cannot parse as
-a JSON literal (see _is_streamable). Values that coerce_param_value() may
-convert (objects, arrays, numbers, booleans, null, quoted strings) are
-emitted whole when their parameter closes.
+Declared string parameter values stream as JSON strings while they are
+generated, including values that look like numbers, booleans or JSON source.
+Without an unambiguous string schema, text streams as soon as it provably
+cannot parse as a JSON literal (see _is_streamable); other values are buffered
+until their parameter closes. Raw values and JSON argument fragments are
+accumulated in lists so long code payloads do not require repeated full copies.
 
 Guarantee: for well-formed calls, the concatenation of all "arguments"
 fragments per index is byte-identical to the arguments string produced by
@@ -52,7 +53,7 @@ _FUNC_CLOSE = "</function>"
 _PARAM_CLOSE = "</parameter>"
 
 # First characters whose stripped value may still json.loads() to something
-# other than the exact input string, per coerce_param_value(). Such values
+# other than the exact input string, per ToolSchemas.coerce(). Such values
 # are emitted whole at parameter close instead of being streamed.
 _JSONY_START = set('"{[0123456789-')
 
@@ -64,7 +65,7 @@ _JSON_KEYWORDS = ("true", "false", "null")
 def _is_streamable(stripped: str) -> bool:
     """
     True once the stripped value accumulated so far provably cannot parse as
-    a JSON literal, i.e. coerce_param_value() will return it as a plain
+    a JSON literal, i.e. ToolSchemas.coerce() will return it as a plain
     string and json.dumps() will quote it exactly as it is streamed.
     """
 
@@ -114,12 +115,19 @@ class QwenToolCallDeltaStreamer:
         self._keys: set[str] = set()
 
         self._param_key: Optional[str] = None
-        self._raw = ""
-        self._streaming = False
-        self._sent = ""
+        self._reset_value()
 
         self._names: list[str] = []
-        self._assembled: list[str] = []
+        self._argument_fragments: list[list[str]] = []
+
+    @property
+    def _assembled(self) -> list[str]:
+        # Materialize once at verification, not once per generated fragment.
+        return ["".join(parts) for parts in self._argument_fragments]
+
+    @_assembled.setter
+    def _assembled(self, values: list[str]):
+        self._argument_fragments = [[value] for value in values]
 
     # -- emission helpers
 
@@ -129,7 +137,7 @@ class QwenToolCallDeltaStreamer:
         self._index += 1
         self._first_param = True
         self._keys = set()
-        self._assembled.append("{")
+        self._argument_fragments.append(["{"])
         self._names.append(name)
         return {
             "index": self._index,
@@ -146,7 +154,7 @@ class QwenToolCallDeltaStreamer:
         return ", " + key + ": "
 
     def _arg_fragment(self, fragment: str) -> dict:
-        self._assembled[self._index] += fragment
+        self._argument_fragments[self._index].append(fragment)
         return {"index": self._index, "function": {"arguments": fragment}}
 
     def _emit(self, deltas: list, delta: dict):
@@ -271,76 +279,119 @@ class QwenToolCallDeltaStreamer:
                         {"function": self._names[self._index], "key": self._param_key},
                     )
                 self._keys.add(self._param_key)
-                self._raw = ""
-                self._streaming = False
-                self._sent = ""
+                self._reset_value()
+                self._value_is_string = self.schemas.is_string(
+                    self._names[self._index], self._param_key
+                )
                 self._state = self._VALUE
 
         return deltas
 
     # -- value handling
 
+    def _reset_value(self):
+        self._raw_parts: list[str] = []
+        self._sent_parts: list[str] = []
+        self._streaming = False
+        self._value_is_string = False
+        self._value_started = False
+        self._string_tail = ""
+        self._pending_whitespace: list[str] = []
+        self._probe = ""
+        self._probe_whitespace = False
+        self._json_value = False
+
+    def _stream_text(self, text: str, deltas: list):
+        if not text:
+            return
+        fragment = _esc(text)
+        if not self._streaming:
+            self._streaming = True
+            fragment = self._param_prefix() + '"' + fragment
+        self._sent_parts.append(text)
+        self._emit(deltas, self._arg_fragment(fragment))
+
     def _consume_value(self, text: str, deltas: list):
         if not text:
             return
+        self._raw_parts.append(text)
 
-        self._raw += text
-
-        if not self._streaming:
-            is_string = self.schemas.is_string(self._names[self._index], self._param_key)
-            stripped = qwen3_coder.normalize_string(self._raw) if is_string else self._raw.strip()
-            # Hold a CR that may still complete a template CRLF.
-            if is_string and stripped.endswith("\r"):
-                stripped = stripped[:-1]
-            if stripped and (is_string or _is_streamable(stripped)):
-                self._streaming = True
-                self._sent = stripped
-                self._emit(deltas, self._arg_fragment(self._param_prefix() + '"' + _esc(stripped)))
+        if self._value_is_string:
+            # normalize_string removes exactly one initial/final LF. Only the
+            # possible final LF needs holdback; spaces, indentation and CR are
+            # data. Work on each new piece instead of re-stripping the entire
+            # accumulated value on every token.
+            if not self._value_started:
+                self._value_started = True
+                text = text.removeprefix("\n")
+            text = self._string_tail + text
+            self._string_tail = "\n" if text.endswith("\n") else ""
+            if self._string_tail:
+                text = text[:-1]
+            self._stream_text(text, deltas)
             return
 
-        # Streaming: the stripped prefix of the raw value grows monotonically;
-        # trailing whitespace stays unemitted until later text makes it
-        # interior, matching the strip() applied by the end-of-stream parser.
-        is_string = self.schemas.is_string(self._names[self._index], self._param_key)
-        candidate = qwen3_coder.normalize_string(self._raw) if is_string else self._raw.strip()
-        if is_string and candidate.endswith("\r"):
-            candidate = candidate[:-1]
-        new = candidate[len(self._sent) :]
-        if new:
-            self._sent = candidate
-            self._emit(deltas, self._arg_fragment(_esc(new)))
+        if self._streaming:
+            # Schema-free strings use strip(). Keep trailing whitespace until
+            # another non-whitespace character makes it interior to the value.
+            core = text.rstrip()
+            core_len = len(core)
+            if core:
+                if self._pending_whitespace:
+                    core = "".join(self._pending_whitespace) + core
+                    self._pending_whitespace = []
+                self._stream_text(core, deltas)
+            tail = text[core_len:]
+            if tail:
+                self._pending_whitespace.append(tail)
+            return
+
+        if self._json_value:
+            return  # JSON-looking values are buffered once, parsed at close.
+
+        # An unresolved prefix is empty or one of t/tr/tru/true/f/.../null.
+        # Track it and whether whitespace followed it using bounded state.
+        # Numbers, arrays, objects and quoted JSON remain buffered. Once text
+        # diverges from a JSON keyword, it can never become JSON later.
+        interior_whitespace = self._probe_whitespace and bool(text.strip())
+        candidate = (self._probe + text).strip()
+        if not candidate:
+            return
+        if interior_whitespace or _is_streamable(candidate):
+            raw = "".join(self._raw_parts)
+            self._stream_text(raw.strip(), deltas)
+            tail = raw[len(raw.rstrip()) :]
+            self._pending_whitespace = [tail] if tail else []
+        elif candidate[0] in _JSONY_START:
+            self._json_value = True
+        else:
+            self._probe = candidate
+            self._probe_whitespace = text[-1].isspace()
 
     def _close_param(self, deltas: list):
+        raw = "".join(self._raw_parts)
+        value = self.schemas.coerce(raw, self._names[self._index], self._param_key)
         if self._streaming:
-            value = self.schemas.coerce(self._raw, self._names[self._index], self._param_key)
-            if value.startswith(self._sent) and len(value) > len(self._sent):
-                self._emit(deltas, self._arg_fragment(_esc(value[len(self._sent) :])))
-                self._sent = value
-            # Close the JSON string. The streamed content must equal the
-            # stripped raw value; guard against any drift.
-            final = json.dumps(
-                self.schemas.coerce(self._raw, self._names[self._index], self._param_key),
-                ensure_ascii=False,
-                allow_nan=False,
-            )
-            streamed = '"' + _esc(self._sent) + '"'
-            if final != streamed:
+            sent = "".join(self._sent_parts)
+            if value.startswith(sent) and len(value) > len(sent):
+                self._stream_text(value[len(sent) :], deltas)
+                sent = value
+            if value != sent:
                 xlogger.error(
                     "Tool-call delta stream diverged from value at parameter close",
                     {"function": self._names[self._index], "key": self._param_key},
                 )
             self._emit(deltas, self._arg_fragment('"'))
         else:
-            value = self.schemas.coerce(self._raw, self._names[self._index], self._param_key)
             self._emit(
                 deltas,
-                self._arg_fragment(self._param_prefix() + json.dumps(value, ensure_ascii=False)),
+                self._arg_fragment(
+                    self._param_prefix() + json.dumps(value, ensure_ascii=False, allow_nan=False)
+                ),
             )
 
         self._param_key = None
-        self._raw = ""
-        self._streaming = False
-        self._sent = ""
+        self._reset_value()
 
     # -- end-of-stream cross-check
 

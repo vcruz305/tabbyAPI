@@ -112,6 +112,34 @@ class QwenSchemaTests(unittest.TestCase):
                     args = "".join(d["function"].get("arguments", "") for d in deltas)
                     self.assertEqual(json.loads(args), {"text": value})
 
+    def test_schema_free_keyword_and_whitespace_splits_match_final_parse(self):
+        for value in [
+            "true",
+            "false",
+            "null",
+            "t",
+            "f",
+            "n",
+            "three",
+            "nullish",
+            "true ",
+            " true \n",
+            "tru  e",
+            "t\n\tr",
+            "null" + " " * 4000 + "x",
+            " " * 4000 + "hello" + "\t" * 4000 + "world",
+            " \t\n" * 4000,
+        ]:
+            raw = xml(params=[("text", value)])
+            expected = qwen3_coder.parse_toolcalls(raw)[0].function.arguments
+            for width in [1, 7, 64, len(raw)]:
+                with self.subTest(value=value[:30], width=width):
+                    stream = QwenToolCallDeltaStreamer()
+                    args = []
+                    for chunk in pieces(raw, width):
+                        args.extend(d["function"].get("arguments", "") for d in stream.feed(chunk))
+                    self.assertEqual("".join(args), expected)
+
     def test_function_and_wrapper_literals_in_parameter_survive(self):
         value = 'print("<think>x</think> </function> <tool_call></tool_call>")'
         calls = qwen3_coder.parse_toolcalls(xml(params=[("code", value)]))
