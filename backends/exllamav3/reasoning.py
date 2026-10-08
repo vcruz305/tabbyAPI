@@ -1,4 +1,4 @@
-"""Producer-side reasoning budgets with an explicit legacy fallback boundary."""
+"""Guarded producer-side reasoning handoff, with optional token budgets."""
 from copy import deepcopy
 from dataclasses import dataclass
 import inspect
@@ -7,13 +7,16 @@ from typing import Any
 
 @dataclass(frozen=True)
 class NativeReasoningBudget:
-    max_tokens: int
+    # None observes a natural ending without imposing any reasoning cutoff.
+    max_tokens: int | None
     output_ids: Any
     end_token_id: int
     parser: Any = None
 
 
-def supports_native_reasoning_budget(job_type):
+def supports_native_reasoning_budget(job_type, *, natural_only=False):
+    if natural_only and getattr(job_type, "supports_natural_token_budget", False) is not True:
+        return False
     setter = getattr(job_type, "set_token_budget", None)
     if not callable(setter):
         return False
@@ -34,19 +37,32 @@ def encode_forced_output(tokenizer, text):
 def prepare_native_reasoning_budget(
     tokenizer, max_tokens, text, *, initial_reasoning, end_token, supported, parser=None
 ):
-    """Only arm an already-active phase with one unambiguous native end token.
+    """Only watch an already-active phase with one native end token.
 
+    A None budget observes natural closure only: it encodes no forced output
+    and changes neither the request's generation limit nor its reasoning policy.
     Later literal reasoning markers may occur inside tool argument strings.
-    They must not arm a producer budget for a request that starts in content.
-    Older engines and other framing formats retain the collector fallback.
+    They must not arm a watcher for a request that starts in content. Older
+    engines and other framing formats retain the collector fallback.
     """
     if not supported or not initial_reasoning or not end_token:
         return None
-    if not isinstance(max_tokens, int) or isinstance(max_tokens, bool) or max_tokens < 0:
-        raise ValueError("A native reasoning budget must be a non-negative integer")
+    if max_tokens is not None and (
+        not isinstance(max_tokens, int) or isinstance(max_tokens, bool) or max_tokens < 0
+    ):
+        raise ValueError("A native reasoning budget must be a non-negative integer or None")
     end_id = tokenizer.single_id(end_token)
     if end_id is None:
         return None
+    if max_tokens is None:
+        # Unlike a finite injection, natural-end observation must have the full
+        # router guard. Raw end-token detection alone is unsafe inside tool data.
+        if (parser is None or not callable(getattr(parser, "checkpoint", None))
+                or not callable(getattr(parser, "restore_checkpoint", None))):
+            return None
+        if text is not None:
+            raise ValueError("Natural reasoning handoff cannot include forced output")
+        return NativeReasoningBudget(None, None, end_id, deepcopy(parser))
     ids = encode_forced_output(tokenizer, text)
     if ids.shape[-1] == 0 or ids[0, -1].item() != end_id:
         return None
@@ -67,12 +83,12 @@ def producer_phase_end_callback(container, request_id):
     def on_end(native_job):
         active = container.active_job_ids.get(request_id)
         if active is None or getattr(active, "job", None) is not native_job:
-            raise RuntimeError("Reasoning budget ended for an inactive generation job")
+            raise RuntimeError("Reasoning phase ended for an inactive generation job")
         # This existing operation respects naturally armed grammar triggers;
         # after forced output it reinstalls suspended content filters. Updating
         # the phase here prevents the later consumer from resetting that grammar.
         if not container.set_generation_phase(request_id, False):
-            raise RuntimeError("Could not apply content settings at the reasoning budget boundary")
+            raise RuntimeError("Could not apply content settings at the reasoning phase boundary")
     return on_end
 
 

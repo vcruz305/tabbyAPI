@@ -1393,7 +1393,8 @@ class ExllamaV3Container:
                 (default) for callers that don't: one set of settings and
                 filters from the first token.
             label: Short name for the request in console logs.
-            reasoning_budget: Prepared producer budget for the initial reasoning phase.
+            reasoning_budget: Prepared initial reasoning handoff; a None limit
+                observes its natural end without forcing a cutoff.
 
         Yields:
             Generation chunks
@@ -1436,13 +1437,12 @@ class ExllamaV3Container:
         reasoning block, swapping in that phase's sampler, banned strings and
         grammar filters. The swap applies from the next token the generator
         samples; tokens it sampled ahead of the caller keep the old settings.
-        With speculative decoding that can be several tokens, which a sampler
-        tolerates and a grammar does not: it would start mid-answer. So where
-        the end-of-reasoning tag is a single token, the filters for the first
-        content block are armed by the engine on that token instead, and only
-        the cases it can't cover are switched from here. A supported initial
-        reasoning budget also invokes this method synchronously in the producer,
-        so its sampler and grammar handoff precedes any following sample.
+        With speculative decoding that can be several tokens, which a grammar
+        cannot tolerate: it would start mid-answer. Supported initial reasoning
+        phases invoke this method synchronously through a guarded producer
+        callback, with or without a budget, before the next token is sampled.
+        Older engines use a raw end-token filter trigger where possible, with
+        consumer-timed switching for the remaining phase settings and formats.
 
         Returns False if the swap has to wait (a forced-output injection is
         still draining) and should be retried on the next chunk.
@@ -1493,7 +1493,7 @@ class ExllamaV3Container:
             text,
             initial_reasoning=initial_reasoning and not self.harmony and not self.muse_glimmer,
             end_token=self.reasoning_end_token,
-            supported=supports_native_reasoning_budget(AsyncJob),
+            supported=supports_native_reasoning_budget(AsyncJob, natural_only=max_tokens is None),
             parser=parser,
         )
 
@@ -1836,7 +1836,7 @@ class ExllamaV3Container:
                 and getattr(self, "reasoning", False)):
             if self.reasoning_end_token:
                 trigger_token_id = self.tokenizer.single_id(self.reasoning_end_token)
-        # A producer budget verifies the full parser state before ending the
+        # A producer handoff verifies the full parser state before ending the
         # phase. A raw token trigger would activate even for a literal closing
         # tag inside a tool argument, before that verification can protect it.
         # Its content filters are attached only by the verified callback.
@@ -1960,7 +1960,11 @@ class ExllamaV3Container:
         # Configure before the first await: even a zero-token budget must be
         # active before the async producer can sample. Producer callbacks also
         # switch content settings before any speculative content is accepted.
-        if reasoning_budget is not None:
+        # A natural-only watcher is unnecessary when both phases have identical
+        # settings. Keep such default jobs on the ordinary verification path.
+        if reasoning_budget is not None and (
+            reasoning_budget.max_tokens is not None or phases is not None
+        ):
             try:
                 boundary_guard = (
                     ReasoningBoundaryGuard(job.job, self.tokenizer, reasoning_budget.parser)

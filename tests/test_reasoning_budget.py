@@ -130,7 +130,7 @@ class PreparationTests(unittest.TestCase):
         self.assertEqual(tokenizer.encode_calls, [])
 
     def test_invalid_budgets_are_rejected(self):
-        for budget in (-1, 1.5, True, None, "24"):
+        for budget in (-1, 1.5, True, "24"):
             with self.subTest(budget=budget):
                 with self.assertRaisesRegex(ValueError, "non-negative integer"):
                     prepared(budget=budget)
@@ -222,15 +222,13 @@ class CollectorBudgetTests(unittest.IsolatedAsyncioTestCase):
                     self.assertNotIn("reasoning_budget", mc.options[0])
                     mc.constrain_generation_output.assert_called_once_with("budget-request", "</think>")
 
-    async def test_no_budget_or_unknown_reasoning_format_does_not_negotiate(self):
+    async def test_unknown_reasoning_format_does_not_negotiate(self):
         for stream in (False, True):
-            for no_format in (False, True):
-                with self.subTest(stream=stream, no_format=no_format):
-                    mc = recording_backend(["answer"])
+            for budget in (None, 2):
+                with self.subTest(stream=stream, budget=budget):
+                    mc = recording_backend(["answer"], reasoning=False)
                     mc.prepare_reasoning_budget = Mock(side_effect=AssertionError("must not prepare"))
-                    if no_format:
-                        mc.reasoning = False
-                    await collect(mc, make_request(tools=None, reasoning_budget_tokens=2 if no_format else None), stream=stream)
+                    await collect(mc, make_request(tools=None, reasoning_budget_tokens=budget), stream=stream)
                     self.assertNotIn("reasoning_budget", mc.options[0])
                     mc.prepare_reasoning_budget.assert_not_called()
                     mc.constrain_generation_output.assert_not_called()

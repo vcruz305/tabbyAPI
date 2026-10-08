@@ -801,14 +801,16 @@ async def _chat_stream_collector(
 
     try:
         prepare_budget = getattr(mc, "prepare_reasoning_budget", None)
-        if (budget_injection is not None and callable(prepare_budget)
+        natural_handoff = budget is None and use_think and start_in_reasoning_mode
+        if ((budget_injection is not None or natural_handoff) and callable(prepare_budget)
                 and not params.response_prefix and not params.continue_final_message):
             native_budget = prepare_budget(
                 budget, budget_injection, start_in_reasoning_mode, parser=parser
             )
             if native_budget is not None:
-                # The producer counts accepted tokens and changes phase settings
-                # atomically; a consumer/SSE-timed second injection would be wrong.
+                # The producer verifies natural endings even without a cutoff.
+                # For finite budgets it also counts accepted tokens; a second
+                # consumer/SSE-timed injection would be wrong.
                 budget_injection = None
         if streaming_mode:
             # SDKs build the final assistant message from deltas, so every

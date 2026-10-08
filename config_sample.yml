@@ -311,7 +311,9 @@ model:
   # partial tag defers injection; max_tokens still bounds the entire response.
   # Other formats, continued messages and older engines use a best-effort boundary
   # that can overshoot with queued/speculative tokens. 0 requests an immediate end;
-  # None or a negative value disables the default budget. Overridable per request via reasoning_budget_tokens
+  # None or a negative value disables the default budget. Supported engines still
+  # guard the natural phase transition when its grammar/sampler settings differ;
+  # this imposes no reasoning cutoff. Overridable per request via reasoning_budget_tokens
   # (aliases: reasoning_budget, thinking_budget, thinking_token_budget) or
   # reasoning.max_tokens. Requires a reasoning format: reasoning tags, Harmony or Muse Glimmer.
   reasoning_budget_tokens:
