@@ -1,4 +1,4 @@
-"""Verify forced Qwen grammar with a real tokenizer, including its token masks.
+"""Verify forced and auto Qwen grammars with real tokenizer sampling masks.
 
 Example: python -m tests.check_qwen_tool_tokenizer /path/to/tokenizer.json
 No model weights or GPU are used. Output records the tokenizer fingerprint.
@@ -13,7 +13,7 @@ from time import perf_counter
 from llguidance import LLMatcher, LLTokenizer
 from tokenizers import Tokenizer
 
-from endpoints.OAI.utils.tool_choice import ForcedToolChoice, literal_token_ids
+from endpoints.OAI.utils.tool_choice import ForcedToolChoice, auto_tool_grammar, literal_token_ids
 
 
 def xml(name, value=None):
@@ -58,9 +58,47 @@ def check(path, eos_text="<|im_end|>"):
             False,
         ),
     ]
+    fixtures = [("required", *case) for case in fixtures]
+    auto_cases = [
+        ("auto_empty", "", ("ping",), True, True),
+        ("auto_no_call", "READY", ("ping",), True, True),
+        ("auto_unicode_text", "The price is 20 €; 東京 <test> ☀️.", ("ping",), True, True),
+        ("auto_long_text", "Here is ordinary text. " * 100, ("ping",), True, True),
+        ("auto_partial_opener", "<tool_cal", ("ping",), True, True),
+        ("auto_overlap_prefix", "<<tool_cal<function<other>", ("ping",), True, True),
+        ("auto_preamble", "I will call it.\n" + xml("ping"), ("ping",), True, True),
+        ("auto_postamble", xml("ping") + "\nDone.", ("ping",), True, True),
+        ("auto_bare", "<function=ping></function>", ("ping",), True, True),
+        ("auto_parallel", xml("ping") + xml("weather"), ("ping", "weather"), True, True),
+        ("auto_parallel_disabled", xml("ping") + xml("ping"), ("ping",), False, False),
+        (
+            "auto_bare_parallel_disabled",
+            xml("ping") + "<function=ping></function>",
+            ("ping",),
+            False,
+            False,
+        ),
+        (
+            "auto_literal_markup",
+            xml("ping", "<think>literal</think> </function> <tool_call></tool_call>"),
+            ("ping",),
+            True,
+            True,
+        ),
+        ("auto_wrong_name", xml("absent"), ("ping",), True, False),
+        ("auto_overlap_wrong_name", "x<" + xml("absent"), ("ping",), True, False),
+        ("auto_incomplete_wrapper", xml("ping") + "<tool_call>", ("ping",), True, False),
+        ("auto_incomplete_function", "<function=ping>", ("ping",), True, False),
+        ("auto_native_message_token", xml("ping", "<|im_start|>literal"), ("ping",), True, False),
+    ]
+    fixtures += [("auto", *case) for case in auto_cases]
     results = []
-    for name, text, names, parallel, expected in fixtures:
-        grammar = ForcedToolChoice(names, parallel).grammar(added_ids)
+    for mode, name, text, names, parallel, expected in fixtures:
+        grammar = (
+            auto_tool_grammar(names, parallel, added_ids)
+            if mode == "auto"
+            else ForcedToolChoice(names, parallel).grammar(added_ids)
+        )
         error = LLMatcher.validate_grammar(grammar, tokenizer)
         if error:
             raise RuntimeError(error)
@@ -91,11 +129,38 @@ def check(path, eos_text="<|im_end|>"):
         results.append(
             {
                 "case": name,
+                "tool_choice": mode,
                 "accepted": valid,
                 "expected": expected,
                 "tokens": len(tokens),
                 "seconds": perf_counter() - start,
             }
+        )
+    # Reproduce the exact kind of prefix from the live failing synthetic call.
+    # Literal think markers must remain legal while conversation boundaries and
+    # premature EOS are masked out. Checking strings alone misses native IDs.
+    prefix = (
+        "<tool_call>\n<function=record_strings>\n"
+        "<parameter=number_text>\n123\n</parameter>\n"
+        "<parameter=bool_text>\ntrue\n</parameter>\n"
+        '<parameter=json_text>\n{"nested": [1, false]}\n</parameter>\n'
+        "<parameter=tag_text>\n"
+    )
+    grammar = auto_tool_grammar(("record_strings",), True, added_ids)
+    matcher = LLMatcher(tokenizer, grammar, log_level=0)
+    if not matcher.consume_tokens(tokenizer.tokenize_str(prefix)):
+        raise AssertionError("captured synthetic argument prefix is not allowed")
+    mask = matcher.compute_bitmask()
+    prefix_masks = []
+    for text, expected in [("<think>", True), ("<|im_start|>", False), (eos_text, False)]:
+        token_id = hf.token_to_id(text)
+        if token_id is None:
+            raise ValueError(f"Required diagnostic token {text!r} not found")
+        allowed = bool(mask[token_id // 8] & (1 << (token_id % 8)))
+        if allowed != expected:
+            raise AssertionError(f"captured prefix: {text} allowed={allowed}, expected {expected}")
+        prefix_masks.append(
+            {"token": text, "token_id": token_id, "allowed": allowed, "expected": expected}
         )
     return {
         "tokenizer_sha256": hashlib.sha256(raw.encode()).hexdigest(),
@@ -103,6 +168,7 @@ def check(path, eos_text="<|im_end|>"):
         "eos_token_id": eos_id,
         "added_literal_tokens": added_ids,
         "cases": results,
+        "captured_prefix_masks": prefix_masks,
     }
 
 
