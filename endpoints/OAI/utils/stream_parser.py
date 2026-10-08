@@ -211,6 +211,13 @@ class Qwen3CoderStreamParser(TagStreamParser):
         self._tag_first = frozenset(t[0] for t in self._tags)
 
     def _handle_tag(self, tag: str, events: list):
+        if tag == self.tool_end and not self.in_tool:
+            # A closing wrapper cannot start a call. Keep examples and stray
+            # closes in their existing content/reasoning channel, just like
+            # unmatched function and parameter closes below.
+            self._route(tag, events)
+            return
+
         if self.in_tool and self._in_parameter:
             if tag == self._PARAMETER_END:
                 self._in_parameter = False

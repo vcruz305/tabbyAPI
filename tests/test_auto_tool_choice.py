@@ -288,6 +288,45 @@ class AutoChoiceTemplateAndCollectorTests(unittest.IsolatedAsyncioTestCase):
         for key in ["messages", "tools", "temperature", "top_p", "reasoning_budget_tokens"]:
             self.assertEqual(data.model_dump()[key], before[key])
 
+    async def test_unmatched_tool_close_stays_in_content_or_reasoning(self):
+        cases = [
+            ("</tool_call>", "</tool_call>", "", 0),
+            ("The close tag is </tool_call>.", "The close tag is </tool_call>.", "", 0),
+            ("</tool_call>" + xml("ping"), "</tool_call>", "", 1),
+            (xml("ping") + "</tool_call>", "</tool_call>", "", 1),
+            (bare("ping") + "</tool_call>", "</tool_call>", "", 1),
+            (RS + "Discuss </tool_call>." + RE + "READY", "READY", "Discuss </tool_call>.", 0),
+        ]
+        for raw, expected_text, expected_thought, count in cases:
+            for chunk_size in [1, 7, 31]:
+                for streaming in [False, True]:
+                    with self.subTest(raw=raw, chunk=chunk_size, streaming=streaming):
+                        frames, result = await run_collector(
+                            make_mc(pieces(raw, chunk_size)),
+                            request(tool_choice="auto"),
+                            streaming=streaming,
+                        )
+                        final = frames[-1] if streaming else result
+                        self.assertEqual(final["finish_reason"], "tool_calls" if count else "stop")
+                        if streaming:
+                            text = "".join(f.get("delta_content", "") for f in frames)
+                            thought = "".join(f.get("delta_reasoning_content", "") for f in frames)
+                            calls = [
+                                d
+                                for f in frames
+                                for d in f.get("delta_tool_calls", [])
+                                if d.get("id")
+                            ]
+                        else:
+                            text, thought, calls = (
+                                result["content"],
+                                result["reasoning_content"],
+                                result["tool_calls"],
+                            )
+                        self.assertEqual(text or "", expected_text)
+                        self.assertEqual(thought or "", expected_thought)
+                        self.assertEqual(len(calls or []), count)
+
     async def test_plain_and_tool_content_preserve_streaming_and_reasoning(self):
         for reasoning in ["", RS + "Choose freely." + RE]:
             for content, expected_reason in [
