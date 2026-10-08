@@ -28,6 +28,14 @@ from exllamav3.cache import CacheLayer_quant
 from backends.exllamav3.grammar import ExLlamaV3Grammar
 
 from backends.exllamav3.sampler import ExllamaV3SamplerBuilder
+from backends.exllamav3.reasoning import (
+    NativeReasoningBudget,
+    ReasoningBoundaryGuard,
+    encode_forced_output,
+    prepare_native_reasoning_budget,
+    producer_phase_end_callback,
+    supports_native_reasoning_budget,
+)
 from backends.exllamav3.utils import exllama_supports_nccl
 from backends.exllamav3.vision import clear_image_embedding_cache, image_embedding_cache
 from common.concurrency import iterate_in_threadpool
@@ -1367,6 +1375,7 @@ class ExllamaV3Container:
         mm_embeddings: Optional[MultimodalEmbeddingWrapper] = None,
         reasoning_phase: Optional[bool] = None,
         label: Optional[str] = None,
+        reasoning_budget: Optional[NativeReasoningBudget] = None,
     ) -> AsyncIterator[Dict[str, Any]]:
         """
         Generates a response iteratively (streaming) for a given prompt.
@@ -1384,6 +1393,7 @@ class ExllamaV3Container:
                 (default) for callers that don't: one set of settings and
                 filters from the first token.
             label: Short name for the request in console logs.
+            reasoning_budget: Prepared producer budget for the initial reasoning phase.
 
         Yields:
             Generation chunks
@@ -1413,6 +1423,7 @@ class ExllamaV3Container:
                 mm_embeddings=mm_embeddings,
                 reasoning_phase=reasoning_phase,
                 label=label,
+                reasoning_budget=reasoning_budget,
             ):
                 yield generation_chunk
         finally:
@@ -1429,7 +1440,9 @@ class ExllamaV3Container:
         tolerates and a grammar does not: it would start mid-answer. So where
         the end-of-reasoning tag is a single token, the filters for the first
         content block are armed by the engine on that token instead, and only
-        the cases it can't cover are switched from here.
+        the cases it can't cover are switched from here. A supported initial
+        reasoning budget also invokes this method synchronously in the producer,
+        so its sampler and grammar handoff precedes any following sample.
 
         Returns False if the swap has to wait (a forced-output injection is
         still draining) and should be retried on the next chunk.
@@ -1473,6 +1486,17 @@ class ExllamaV3Container:
         phases.reasoning = reasoning
         return True
 
+    def prepare_reasoning_budget(self, max_tokens, text, initial_reasoning, parser=None):
+        return prepare_native_reasoning_budget(
+            self.tokenizer,
+            max_tokens,
+            text,
+            initial_reasoning=initial_reasoning and not self.harmony and not self.muse_glimmer,
+            end_token=self.reasoning_end_token,
+            supported=supports_native_reasoning_budget(AsyncJob),
+            parser=parser,
+        )
+
     def constrain_generation_output(self, request_id: str, text: str) -> bool:
         """
         Force `text` into the output stream of an active generation job: the
@@ -1498,9 +1522,7 @@ class ExllamaV3Container:
         # Encode here rather than passing the string through: tokenizers with
         # a BOS post-processor (Llama-3 style) prepend BOS regardless of
         # add_bos, which would corrupt the injection
-        ids = self.tokenizer.encode(text, encode_special_tokens=True, add_bos=False)
-        if ids.shape[-1] > 0 and ids[0, 0].item() == self.tokenizer.bos_token_id:
-            ids = ids[:, 1:]
+        ids = encode_forced_output(self.tokenizer, text)
         if ids.shape[-1] == 0:
             return False
 
@@ -1705,6 +1727,7 @@ class ExllamaV3Container:
         mm_embeddings: Optional[MultimodalEmbeddingWrapper] = None,
         reasoning_phase: Optional[bool] = None,
         label: Optional[str] = None,
+        reasoning_budget: Optional[NativeReasoningBudget] = None,
     ):
         """
         Create generator function for prompt completion.
@@ -1809,9 +1832,14 @@ class ExllamaV3Container:
         # swapped in by set_generation_phase. Otherwise from the first token
         trigger_token_id = None
         constrained = params.json_schema or params.regex_pattern or params.grammar_string
-        if constrained and reasoning_phase and getattr(self, "reasoning", False):
+        if (constrained and reasoning_phase and reasoning_budget is None
+                and getattr(self, "reasoning", False)):
             if self.reasoning_end_token:
                 trigger_token_id = self.tokenizer.single_id(self.reasoning_end_token)
+        # A producer budget verifies the full parser state before ending the
+        # phase. A raw token trigger would activate even for a literal closing
+        # tag inside a tool argument, before that verification can protect it.
+        # Its content filters are attached only by the verified callback.
 
         if params.json_schema:
             # After a reasoning block the model expects to start on a new line
@@ -1929,6 +1957,26 @@ class ExllamaV3Container:
         if phases is not None:
             phases.job = job
             self.job_phases[request_id] = phases
+        # Configure before the first await: even a zero-token budget must be
+        # active before the async producer can sample. Producer callbacks also
+        # switch content settings before any speculative content is accepted.
+        if reasoning_budget is not None:
+            try:
+                boundary_guard = (
+                    ReasoningBoundaryGuard(job.job, self.tokenizer, reasoning_budget.parser)
+                    if reasoning_budget.parser is not None else None
+                )
+                job.set_token_budget(
+                    reasoning_budget.max_tokens,
+                    reasoning_budget.output_ids,
+                    end_token_id=reasoning_budget.end_token_id,
+                    on_end=producer_phase_end_callback(self, request_id),
+                    can_end=boundary_guard,
+                )
+            except BaseException:
+                self.job_phases.pop(request_id, None)
+                await job.cancel()
+                raise
         await disconnect_handler.add_cleanup_task(id(job), job.cancel, ())
         job_status = status_display.add_job(request_id, label, context_len)
 

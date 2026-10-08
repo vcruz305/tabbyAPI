@@ -82,6 +82,16 @@ class TagStreamParser:
         self._max_hold = max((len(t) - 1 for t in tags), default=0)
         self._tag_first = frozenset(t[0] for t in tags)
 
+    def checkpoint(self):
+        """Capture incremental routing state without copying accumulated output."""
+        return (self.in_reasoning, self.in_tool, self.saw_tag, self._pending,
+                self._holding_ws, self._held_ws)
+
+    def restore_checkpoint(self, state):
+        """Restore a previously accepted prefix after a generation rewind."""
+        (self.in_reasoning, self.in_tool, self.saw_tag, self._pending,
+         self._holding_ws, self._held_ws) = state
+
     @property
     def in_content(self) -> bool:
         """True while text is being routed to the content channel."""
@@ -209,6 +219,13 @@ class Qwen3CoderStreamParser(TagStreamParser):
         self._tag_re = re.compile("|".join(re.escape(t) for t in self._tags))
         self._max_hold = max(len(t) - 1 for t in self._tags)
         self._tag_first = frozenset(t[0] for t in self._tags)
+
+    def checkpoint(self):
+        return super().checkpoint(), self._in_parameter, self._wrapped
+
+    def restore_checkpoint(self, state):
+        parent_state, self._in_parameter, self._wrapped = state
+        super().restore_checkpoint(parent_state)
 
     def _handle_tag(self, tag: str, events: list):
         if tag == self.tool_end and not self.in_tool:

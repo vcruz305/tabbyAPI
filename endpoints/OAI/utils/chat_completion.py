@@ -784,6 +784,7 @@ async def _chat_stream_collector(
             xlogger.debug(
                 "A reasoning budget was requested but the model has no reasoning format; ignoring."
             )
+    native_budget = None
     reasoning_tokens = 0
 
     # The backend holds one set of sampler settings for reasoning and one for
@@ -799,18 +800,30 @@ async def _chat_stream_collector(
     collected_logprobs = []
 
     try:
+        prepare_budget = getattr(mc, "prepare_reasoning_budget", None)
+        if (budget_injection is not None and callable(prepare_budget)
+                and not params.response_prefix and not params.continue_final_message):
+            native_budget = prepare_budget(
+                budget, budget_injection, start_in_reasoning_mode, parser=parser
+            )
+            if native_budget is not None:
+                # The producer counts accepted tokens and changes phase settings
+                # atomically; a consumer/SSE-timed second injection would be wrong.
+                budget_injection = None
         if streaming_mode:
             # SDKs build the final assistant message from deltas, so every
             # choice needs its role even if it emits only tools or no text.
             await gen_queue.put({"index": task_idx, "delta_role": "assistant"})
+        backend_options = {"reasoning_phase": phase_applied, "label": label}
+        if native_budget is not None:
+            backend_options["reasoning_budget"] = native_budget
         new_generation = mc.stream_generate(
             request_id,
             prompt,
             params,
             disconnect_handler,
             mm_embeddings,
-            reasoning_phase=phase_applied,
-            label=label,
+            **backend_options,
         )
         generation = {"index": task_idx}
         async for generation in new_generation:
@@ -858,9 +871,10 @@ async def _chat_stream_collector(
                 if mc.set_generation_phase(request_id, parser.in_reasoning):
                     phase_applied = parser.in_reasoning
 
-            # Count reasoning tokens and force the end of the reasoning phase
-            # when the budget is exhausted. Attribution is approximate: a
-            # chunk counts as reasoning if the parser is still in reasoning
+            # Legacy fallback for engines/formats without a producer budget.
+            # Count reasoning tokens and force the phase end when exhausted.
+            # Attribution is approximate: a chunk counts as reasoning if
+            # the parser is still in reasoning
             # after consuming it, and the injection lands a few tokens late
             # (tokens sampled ahead of this consumer precede it).
             if budget_injection is not None and parser.in_reasoning and not parser.in_tool:
