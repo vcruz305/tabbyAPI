@@ -98,9 +98,10 @@ class QwenToolCallDeltaStreamer:
     _OUT = 0
     _VALUE = 1
 
-    def __init__(self, tools=None, max_calls=None):
+    def __init__(self, tools=None, max_calls=None, validate_name=None):
         self.schemas = qwen3_coder.ToolSchemas(tools)
         self.max_calls = max_calls
+        self.validate_name = validate_name
         self.completed = 0
         self.emitted = False
 
@@ -123,6 +124,8 @@ class QwenToolCallDeltaStreamer:
     # -- emission helpers
 
     def _open_function(self, name: str) -> dict:
+        if self.validate_name is not None:
+            self.validate_name(name, self._index + 1)
         self._index += 1
         self._first_param = True
         self._keys = set()

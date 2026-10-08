@@ -52,6 +52,11 @@ from endpoints.OAI.utils.tools import (
 from endpoints.OAI.utils.common_ import aggregate_usage_stats, get_timings, get_usage_stats
 from endpoints.OAI.utils.toolcall_stream import QwenToolCallDeltaStreamer
 from common.errors import ToolCallParseError
+from endpoints.OAI.utils.tool_choice import (
+    function_name,
+    prepare_forced_tool_choice,
+    resolve_forced_tool_choice,
+)
 
 
 def _start_in_reasoning_mode(prompt: str, user_suffix_len: int = 0) -> bool:
@@ -505,10 +510,18 @@ async def apply_chat_template(data: ChatCompletionRequest):
     Template stop strings can be overriden by sampler overrides if force is true.
     """
 
+    forced_choice = prepare_forced_tool_choice(data, getattr(model.container, "tool_format", None))
     normalize_message_roles(data)
 
-    # Locally store tools dict
+    # A named choice only exposes the selected declaration to the template;
+    # the original tools remain available for parsing history and arguments.
     tools = data.model_dump()["tools"] if data.tool_choice != "none" else None
+    functions = data.functions if data.tool_choice != "none" else None
+    if forced_choice is not None:
+        if tools:
+            tools = [tool for tool in tools if function_name(tool) in forced_choice.names]
+        if functions:
+            functions = [tool for tool in functions if function_name(tool) in forced_choice.names]
 
     try:
         data.template_vars = resolve_template_vars(data, model.container)
@@ -516,7 +529,7 @@ async def apply_chat_template(data: ChatCompletionRequest):
             {
                 "add_generation_prompt": data.add_generation_prompt,
                 "tools": tools,
-                "functions": data.functions if data.tool_choice != "none" else None,
+                "functions": functions,
                 "tool_choice": (
                     data.tool_choice.model_dump()
                     if hasattr(data.tool_choice, "model_dump")
@@ -683,6 +696,7 @@ async def _chat_stream_collector(
     full_reasoning = ""
     full_content = ""
     full_tool = ""
+    forced_choice = resolve_forced_tool_choice(params)
 
     if mc.harmony:
         # Harmony messages carry their own channel structure, superseding the
@@ -719,7 +733,9 @@ async def _chat_stream_collector(
             tool_start=t_tool_start if use_tool else None,
             tool_end=t_tool_end if use_tool else None,
             start_in_reasoning=start_in_reasoning_mode,
-            tool_calls_in_reasoning=mc.tool_calls_in_reasoning,
+            # Forced-call grammar is applied to content after reasoning.
+            # Examples in thought must not become executable call deltas.
+            tool_calls_in_reasoning=False if forced_choice else mc.tool_calls_in_reasoning,
         )
 
     # Incremental tool_calls deltas: for formats that support it, emit
@@ -731,6 +747,7 @@ async def _chat_stream_collector(
         tool_streamer = QwenToolCallDeltaStreamer(
             tools=params.tools or params.functions,
             max_calls=1 if params.parallel_tool_calls is False else None,
+            validate_name=forced_choice.validate_name if forced_choice else None,
         )
 
     # Reasoning budget: when the reasoning phase exceeds the budget, force
@@ -844,7 +861,9 @@ async def _chat_stream_collector(
                     label,
                     tools=params.tools or params.functions,
                     streaming=streaming_mode,
-                    max_calls=1 if params.parallel_tool_calls is False else None,
+                    max_calls=(
+                        1 if params.parallel_tool_calls is False and not forced_choice else None
+                    ),
                 )
                 if finish_reason == "stop":
                     if not parsed_calls:
@@ -865,6 +884,9 @@ async def _chat_stream_collector(
                             tool_streamer.verify(full_tool, request_id)
                     elif parsed_calls:
                         output_events.append({"delta_tool_calls": parsed_calls})
+
+            if finish_reason and forced_choice:
+                forced_choice.validate_calls(parsed_calls, require_call=finish_reason == "stop")
 
             # Keep channel order even when one backend chunk contains reasoning,
             # content and a tool call. Typical single-channel chunks still use
