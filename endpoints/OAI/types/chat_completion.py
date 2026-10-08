@@ -3,7 +3,7 @@ from time import time
 from typing import Literal, Union, List, Optional, Dict
 from uuid import uuid4
 
-from endpoints.OAI.types.common import UsageStats, CommonCompletionRequest
+from endpoints.OAI.types.common import UsageStats, CommonCompletionRequest, Timings
 from endpoints.OAI.types.tools import NamedToolChoice, ToolSpec, ToolCall
 
 
@@ -129,11 +129,16 @@ class ChatCompletionRequest(CommonCompletionRequest):
         ),
         description=(
             "Aliases: reasoning_budget, thinking_budget, thinking_token_budget. "
-            "Token budget for reasoning content: when exceeded, the server "
-            "forces the end of the reasoning phase so the model answers with "
-            "what it has. 0 ends reasoning as soon as it starts; a negative "
-            "value or None defers to the server-side default (unlimited if "
-            "unset). Requires a model with a configured reasoning format."
+            "Token budget for reasoning content. With a supporting engine and an "
+            "initially active reasoning phase closed by one native token, the "
+            "producer injects the ending before accepted output token N+1, "
+            "deferring across an open tool call or partial markup prefix. Other "
+            "formats, continued messages and older engines use a best-effort boundary that may "
+            "overshoot with queued or speculative tokens. The injected message "
+            "and ending still consume max_tokens. A small budget can interrupt "
+            "a sentence. 0 requests an immediate end; a negative value or None "
+            "defers to the server default (unlimited if unset). Requires a model "
+            "with a configured reasoning format."
         ),
     )
     reasoning_budget_message: Optional[str] = Field(
@@ -177,6 +182,7 @@ class ChatCompletionResponse(BaseModel):
     model: str
     object: str = "chat.completion"
     usage: Optional[UsageStats] = None
+    timings: Optional[Timings] = None
 
 
 class ChatCompletionStreamChunk(BaseModel):

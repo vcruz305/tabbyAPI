@@ -1,6 +1,11 @@
 import pathlib
 from common import model
-from endpoints.OAI.types.common import UsageStats
+from endpoints.OAI.types.common import (
+    CompletionTokensDetails,
+    PromptTokensDetails,
+    Timings,
+    UsageStats,
+)
 from common.tabby_config import config
 from common.auth import get_key_permission
 from common.logger import xlogger
@@ -21,15 +26,72 @@ def get_usage_stats(
     completion_tokens = generation.get("gen_tokens", 0)
     usage_stats = UsageStats(
         prompt_tokens=prompt_tokens,
+        prompt_tokens_details=PromptTokensDetails(
+            cached_tokens=round(generation.get("cached_tokens") or 0)
+        ),
         prompt_time=generation.get("prompt_time"),
         prompt_tokens_per_sec=generation.get("prompt_tokens_per_sec"),
         completion_tokens=completion_tokens,
+        completion_tokens_details=CompletionTokensDetails(
+            accepted_prediction_tokens=generation.get("draft_accept") or 0,
+            rejected_prediction_tokens=generation.get("draft_reject") or 0,
+        ),
         completion_time=generation.get("gen_time"),
         completion_tokens_per_sec=generation.get("gen_tokens_per_sec"),
         total_tokens=prompt_tokens + completion_tokens,
         total_time=generation.get("total_time"),
     )
     return usage_stats
+
+
+def get_timings(
+    generation: dict,
+) -> Timings | None:
+    """
+    Collect llama-server compatible timings from generation if it is a finish chunk
+
+    Key mapping follows llama.cpp's server_slot_stats::to_json
+    (tools/server/server-common.cpp). Rates are computed from the times, never
+    from the backend's *_tokens_per_sec fields, which carry the string
+    "Indeterminate" when a time is zero; a zero time yields 0.0 like llama.cpp.
+    """
+    if "finish_reason" not in generation:
+        return None
+
+    cache_n = round(generation.get("cached_tokens") or 0)
+    prompt_n = max((generation.get("prompt_tokens") or 0) - cache_n, 0)
+    prompt_ms = (generation.get("prompt_time") or 0) * 1000
+    predicted_n = generation.get("gen_tokens") or 0
+    predicted_ms = (generation.get("gen_time") or 0) * 1000
+
+    # llama.cpp divides by n_gen - 1 because its first token comes from the
+    # prompt batch's logits, outside the generation time. In exllamav3 the
+    # prompt is prefilled up to its last token (Job.is_prefill_done), and
+    # time_first_token is stamped before the decode pass that produces the
+    # first token, so gen_time covers all gen_tokens tokens. Dividing by
+    # gen_tokens gives the same meaning as llama.cpp's figure on this backend.
+
+    # llama.cpp sets the draft keys only when draft tokens were produced
+    # (n_draft_tokens > 0), so they stay absent otherwise
+    draft = {}
+    draft_accept = generation.get("draft_accept") or 0
+    draft_reject = generation.get("draft_reject") or 0
+    if draft_accept + draft_reject > 0:
+        draft["draft_n"] = draft_accept + draft_reject
+        draft["draft_n_accepted"] = draft_accept
+
+    return Timings(
+        cache_n=cache_n,
+        prompt_n=prompt_n,
+        prompt_ms=prompt_ms,
+        prompt_per_token_ms=prompt_ms / prompt_n if prompt_n > 0 else 0.0,
+        prompt_per_second=1e3 / prompt_ms * prompt_n if prompt_ms > 0 else 0.0,
+        predicted_n=predicted_n,
+        predicted_ms=predicted_ms,
+        predicted_per_token_ms=predicted_ms / predicted_n if predicted_n > 0 else 0.0,
+        predicted_per_second=1e3 / predicted_ms * predicted_n if predicted_ms > 0 else 0.0,
+        **draft,
+    )
 
 
 def aggregate_usage_stats(usage_stats_list: list[UsageStats]) -> UsageStats:
@@ -46,11 +108,22 @@ def aggregate_usage_stats(usage_stats_list: list[UsageStats]) -> UsageStats:
     total_tokens = prompt_tokens + completion_tokens
     total_time = prompt_time + completion_time
 
+    # n > 1 generations share one prompt, so prompt-side details come from the
+    # first entry while generation-side counters accumulate
     usage_stats = UsageStats(
         prompt_tokens=prompt_tokens,
+        prompt_tokens_details=usl[0].prompt_tokens_details,
         prompt_time=prompt_time,
         prompt_tokens_per_sec=prompt_tokens_per_sec,
         completion_tokens=completion_tokens,
+        completion_tokens_details=CompletionTokensDetails(
+            accepted_prediction_tokens=sum(
+                us.completion_tokens_details.accepted_prediction_tokens for us in usl
+            ),
+            rejected_prediction_tokens=sum(
+                us.completion_tokens_details.rejected_prediction_tokens for us in usl
+            ),
+        ),
         completion_time=completion_time,
         completion_tokens_per_sec=completion_tokens_per_sec,
         total_tokens=total_tokens,
@@ -70,15 +143,35 @@ def _is_loaded_model(model_name: str) -> bool:
     if not (model.container and model.container.loaded):
         return False
 
-    loaded_model_dir = model.container.model_dir
+    return _matches_model_path(model_name, model.container.model_dir)
+
+
+def _matches_model_path(model_name: str, loaded_model_dir: pathlib.Path) -> bool:
     if loaded_model_dir.name == model_name:
         return True
 
     requested_path = pathlib.Path(config.model.model_dir) / model_name
     try:
         return requested_path.resolve() == loaded_model_dir.resolve()
-    except OSError:
+    except (OSError, RuntimeError, ValueError):
         return False
+
+
+def response_model_name(requested: str | None, loaded_model_dir: pathlib.Path) -> str:
+    """Keep verified public aliases, never echo a silently ignored model name.
+
+    Inline loading can be disabled, in which case load_inline_model preserves
+    legacy behavior and ignores an unrecognized request name. Such responses
+    identify the actual loaded model. Explicitly configured dummy names are
+    intentional compatibility aliases and may still be returned.
+    """
+
+    if requested and (
+        _matches_model_path(requested, loaded_model_dir)
+        or (config.model.use_dummy_models and requested in config.model.dummy_model_names)
+    ):
+        return requested
+    return loaded_model_dir.name
 
 
 async def load_inline_model(model_name: str, request: Request):
@@ -125,14 +218,28 @@ async def load_inline_model(model_name: str, request: Request):
     model_path = pathlib.Path(config.model.model_dir)
     model_path = model_path / model_name
 
-    # Model path doesn't exist
+    # A request that names a model it can't get must fail rather than run on
+    # whatever happens to be loaded: the client asked for a specific model, and
+    # an answer from a different one is wrong in a way it cannot detect
     if not model_path.exists():
-        xlogger.warning(f"Could not find model path {str(model_path)}. Skipping inline model load.")
+        error_message = handle_request_error(
+            f"Model {model_name} was not found in the model directory.",
+            exc_info=False,
+        ).error.message
 
-        return
+        raise HTTPException(404, error_message)
 
     # Load the model and also add draft dir
-    await model.load_model(
-        model_path,
-        draft_model=config.draft_model.model_dump(include={"draft_model_dir"}),
-    )
+    try:
+        await model.load_model(
+            model_path,
+            draft_model=config.draft_model.model_dump(include={"draft_model_dir"}),
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        error_message = handle_request_error(
+            f"Model {model_name} failed to load: {exc}"
+        ).error.message
+
+        raise HTTPException(503, error_message) from exc

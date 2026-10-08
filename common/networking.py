@@ -1,7 +1,9 @@
 """Common utility functions"""
 
 import asyncio
+import itertools
 import json
+import platform
 import socket
 import traceback
 from fastapi import Depends, HTTPException, Request
@@ -140,10 +142,10 @@ class DisconnectHandler:
 
         # Log and raise
         if not self._reported:
-            xlogger.error(f"Request disconnected: {self.description}")
+            xlogger.warning(f"{self.description}: client disconnected, generation cancelled")
             self._reported = True
 
-        raise asyncio.CancelledError(f"Request disconnected: {self.description}")
+        raise asyncio.CancelledError(f"{self.description}: client disconnected")
 
     async def add_cleanup_task(self, key, func, args):
         # Intentionally strict
@@ -191,30 +193,72 @@ async def run_with_request_disconnect(
         raise HTTPException(422, disconnect_message) from ex
 
 
-def is_port_in_use(port: int) -> bool:
+def port_bind_error(host: str, port: int) -> Optional[str]:
     """
-    Checks if a port is in use
+    Why the server could not listen on host:port, or None if it can.
 
-    From https://stackoverflow.com/questions/2470971/fast-way-to-test-if-a-port-is-in-use-using-python
+    Checks by binding a throwaway socket to the same address the server will
+    bind, with the same options, so the answer matches what the server is about
+    to find out. (Connecting to localhost instead, as this used to, answers a
+    different question: it reports a listener on the loopback interface whether
+    or not it blocks our bind, e.g. a Docker port mapping while the server is
+    configured for another interface, and misses listeners on other interfaces.)
     """
 
-    test_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    test_socket.settimeout(1)
-    with test_socket:
-        return test_socket.connect_ex(("localhost", port)) == 0
+    try:
+        addresses = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM, flags=socket.AI_PASSIVE)
+    except socket.gaierror as ex:
+        return f"{host} is not a usable address: {ex}"
+
+    for family, socktype, proto, _, sockaddr in addresses:
+        try:
+            probe = socket.socket(family, socktype, proto)
+        except OSError:
+            # Address family not supported here (e.g. IPv6 disabled)
+            continue
+
+        with probe:
+            # The server's event loop sets the same options: reuse of a port
+            # left in TIME_WAIT on POSIX (never on Windows, where the flag
+            # lets a second listener take over the port), one socket per
+            # address family
+            if family == socket.AF_INET6 and hasattr(socket, "IPV6_V6ONLY"):
+                probe.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+            if platform.system() != "Windows":
+                probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+
+            try:
+                probe.bind(sockaddr)
+            except OSError as ex:
+                reason = ex.strerror or str(ex)
+                return f"{reason} ({sockaddr[0]}:{sockaddr[1]})"
+
+    return None
+
+
+# Short per-process serial for console log lines; the UUID stays the API-facing id
+_request_serials = itertools.count(1)
 
 
 async def add_request_id(request: Request):
-    """FastAPI depends to add a UUID to a request's state."""
+    """FastAPI depends to add a UUID and a console serial to a request's state."""
 
     request.state.id = uuid4().hex
+    request.state.serial = next(_request_serials)
     return request
+
+
+def request_tag(request: Request) -> str:
+    """Short tag identifying a request in console logs, e.g. "#12"."""
+
+    serial = getattr(request.state, "serial", None)
+    return f"#{serial}" if serial is not None else f"#{request.state.id[:8]}"
 
 
 async def log_request(request: Request):
     """FastAPI depends to log a request to the user."""
 
-    log_message = [f"Information for {request.method} request {request.state.id}:"]
+    log_message = [f"{request_tag(request)} {request.method} request (ID {request.state.id}):"]
 
     log_message.append(f"URL: {request.url}")
     log_message.append(f"Headers: {dict(request.headers)}")

@@ -14,6 +14,7 @@ from common.model import check_embeddings_container, check_model_container
 from common.networking import (
     get_sse_ping_interval,
     handle_request_error,
+    request_tag,
     DisconnectHandler,
     run_with_request_disconnect,
 )
@@ -71,15 +72,14 @@ async def completion_request(request: Request, data: CompletionRequest) -> Compl
     async with load_lock:
         if data.model:
             await load_inline_model(data.model, request)
-        else:
-            await check_model_container()
+        await check_model_container()
         model_path = model.container.model_dir
 
     # Prepare raw prompt (will be str or list[str])
     prompt = data.prompt
 
-    # Set an empty JSON schema if the request wants a JSON response
-    if data.response_format.type == "json":
+    # Any JSON object, no particular schema. "json_object" is OpenAI's name for it
+    if data.response_format.type in ("json_object", "json"):
         data.json_schema = {"type": "object"}
 
     # Also accept specific schema from response_format
@@ -87,7 +87,7 @@ async def completion_request(request: Request, data: CompletionRequest) -> Compl
         data.json_schema = data.response_format.json_schema
 
     try:
-        disconnect_handler = DisconnectHandler(request, "/v1/completions")
+        disconnect_handler = DisconnectHandler(request, f"{request_tag(request)} completions")
         await disconnect_handler.poll()
 
         if data.stream and not config.developer.disable_request_streaming:
@@ -126,8 +126,7 @@ async def chat_completion_request(
     async with load_lock:
         if data.model:
             await load_inline_model(data.model, request)
-        else:
-            await check_model_container()
+        await check_model_container()
         model_path = model.container.model_dir
 
     # Prepare raw prompt
@@ -140,8 +139,8 @@ async def chat_completion_request(
     prompt, mm_embeddings = await apply_chat_template(data)
     await write_chat_completion_prompt_log(request, prompt)
 
-    # Set an empty JSON schema if the request wants a JSON response
-    if data.response_format.type == "json":
+    # Any JSON object, no particular schema. "json_object" is OpenAI's name for it
+    if data.response_format.type in ("json_object", "json"):
         data.json_schema = {"type": "object"}
 
     # Also accept specific schema from response_format
@@ -149,7 +148,7 @@ async def chat_completion_request(
         data.json_schema = data.response_format.json_schema
 
     try:
-        disconnect_handler = DisconnectHandler(request, "/v1/chat/completions")
+        disconnect_handler = DisconnectHandler(request, f"{request_tag(request)} chat/completions")
         await disconnect_handler.poll()
 
         if data.stream and not config.developer.disable_request_streaming:
@@ -170,6 +169,29 @@ async def chat_completion_request(
         raise HTTPException(422, "/v1/chat/completions request cancelled by user.") from ex
 
 
+# Apply template endpoint (llama-server compatible)
+@router.post("/apply-template", dependencies=[Depends(check_api_key)])
+@router.post("/v1/apply-template", dependencies=[Depends(check_api_key)])
+async def apply_template_request(data: ChatCompletionRequest) -> dict:
+    """
+    Renders the chat template for the given messages without generating and
+    returns the resulting prompt. Clients use this to probe the template, e.g.
+    whether it reacts to a thinking toggle.
+    """
+
+    await check_model_container()
+
+    if model.container.prompt_template is None:
+        error_message = handle_request_error(
+            "Cannot apply a template because a prompt template is not set.",
+            exc_info=False,
+        ).error.message
+        raise HTTPException(422, error_message)
+
+    prompt, _ = await apply_chat_template(data)
+    return {"prompt": prompt}
+
+
 # Embeddings endpoint
 @router.post(
     "/v1/embeddings",
@@ -180,7 +202,7 @@ async def embeddings(request: Request, data: EmbeddingsRequest) -> EmbeddingsRes
     response = await run_with_request_disconnect(
         request,
         embeddings_task,
-        f"Embeddings request {request.state.id} cancelled",
+        f"{request_tag(request)} embeddings cancelled by client",
     )
 
     return response

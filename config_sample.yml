@@ -13,12 +13,22 @@ network:
   host: 127.0.0.1
 
   # The port to host on (default: 5000).
+  # TabbyAPI exits if the port is taken rather than moving to another one.
   port: 5000
 
   # Disable HTTP token authentication with requests.
   # WARNING: This will make your instance vulnerable!
-  # Turn on this option if you are ONLY connecting from localhost.
+  # Only turn this on if nothing but trusted local clients can reach the API.
+  # Note that web pages open in a browser on this machine also count as local
+  # callers; restrict allowed_origins below if you disable auth.
   disable_auth: false
+
+  # Origins allowed to call the API from a browser (default: ["*"]).
+  # This is a CORS allowlist, not authentication: "*" lets any site open in your
+  # browser send requests to this instance, which matters most when disable_auth
+  # is on. Restrict to your own frontends (e.g. ["http://localhost:8000"]) or use
+  # an empty list [] to block all browser (cross-origin) callers.
+  allowed_origins: ["*"]
 
   # Disable fetching external content in response to requests,such as images from URLs.
   disable_fetch_requests: false
@@ -36,6 +46,10 @@ network:
   # connections from dropping during long prefills. Set to 0 to disable.
   sse_ping_interval: 15
 
+  # Log every HTTP request with client address, method, path and status (default: False).
+  # Generation requests are already logged in detail; this adds the rest, such as model list and health polls.
+  access_log: false
+
 # Options for logging
 logging:
   # Enable prompt logging (default: False).
@@ -47,6 +61,14 @@ logging:
   # Enable request logging (default: False).
   # NOTE: Only use this for debugging!
   log_requests: false
+
+  # Show a live status line below the log with cache usage and in-flight jobs (default: True).
+  # Only shown on an interactive terminal.
+  log_live_status: true
+
+  # Prefix console log lines with the time of day (default: True).
+  # The log files under logs/ always carry full timestamps.
+  log_timestamps: true
 
   # Write every /v1/chat/completions request to logs/debug/ as JSON (default: False).
   # Also saves the fully templated prompt (the exact text sent to the tokenizer)
@@ -65,8 +87,9 @@ model:
   model_dir: models
 
   # Allow direct loading of models from a completion or chat completion request (default: False).
-  # This method of loading is strict by default.
-  # Enable dummy models to add exceptions for invalid model names.
+  # This method of loading is strict: a request naming a model that doesn't exist or fails to load
+  # is rejected instead of running on the loaded model. Enable dummy models to add exceptions for
+  # model names that clients send without meaning a specific model.
   inline_model_loading: false
 
   # Sends dummy model names when the models endpoint is queried. (default: False)
@@ -119,8 +142,12 @@ model:
   # Not parsed for single GPU users.
   gpu_split_auto: true
 
-  # Reserve VRAM used for autosplit loading (default: 96 MB on GPU 0).
+  # Reserve VRAM used when loading a model (default: 96 MB on GPU 0).
   # Represented as an array of MB per GPU.
+  # A negative value excludes that GPU from the model split, so
+  # excluding every GPU will fail to load.
+  # Ignored for a model whose placement is already set by gpu_split
+  # or draft_gpu_split.
   autosplit_reserve: [96]
 
   # Array of VRAM sizes to split between GPUs, in GB (default: []).
@@ -149,6 +176,12 @@ model:
   # the table is streamed from disk during inference; loading it into RAM avoids
   # per-token disk reads at the cost of tens of GB of system memory.
   ngram_ram: false
+
+  # Stream token embeddings from disk on demand (default: False).
+  # Rows of the token embedding table are read per forward pass instead of holding the
+  # whole table in system RAM. Saves memory on models with large vocabularies at the cost
+  # of small disk reads during inference. Works for quantized and unquantized tables.
+  embed_stream_from_disk: false
 
   # NOTE: If a model has YaRN rope scaling, it will automatically be enabled by ExLlama.
   # rope_scale and rope_alpha settings won't apply in this case.
@@ -182,6 +215,26 @@ model:
   # can reduce it further to minimize VRAM overhead.
   max_batch_size:
 
+  # Tokens between recurrent state checkpoints near the end of the prompt and
+  # during generation (default: None, the engine's per-architecture default,
+  # 2048 for most models). Only used by models with recurrent (linear or sliding
+  # attention) layers. Must be a multiple of 256.
+  recurrent_checkpoint_interval:
+
+  # Tokens between recurrent state checkpoints during prompt ingestion, further
+  # than 2 * chunk_size from the end of the prompt (default: None, the engine
+  # default of 32768). Only used by models with recurrent layers. Must be a
+  # multiple of 256 and is rounded up to a multiple of chunk_size.
+  # Recurrent states cannot be rolled back, so a request that edits an earlier
+  # part of a cached prompt replays from the last checkpoint before the edit.
+  # With the default, a long prompt is only checkpointed near its end and an
+  # early edit costs a full re-prefill; with a denser grid the replay cost becomes
+  # proportional to the distance from the edit to the end of the prompt.
+  # Each checkpoint costs one recurrent state of system RAM (148 MiB for a 27B
+  # hybrid with 48 recurrent layers), bounded by memory.sysmem_recurrent_cache,
+  # and cold prefill is 2-3% slower at 2048 or 1024.
+  recurrent_checkpoint_interval_pp:
+
   # Set the prompt template for this model. (default: None)
   # If empty, attempts to look for the model's chat template.
   # If a model contains multiple templates in its tokenizer_config.json,
@@ -191,6 +244,23 @@ model:
 
   # Enables vision support if the model supports it. (default: False)
   vision: false
+
+  # Sampler overrides for this model (default: None).
+  # Same syntax as the top-level sampling section: an optional override_preset plus any
+  # sampler written inline. Applied on top of the global sampling section while this model
+  # is loaded; meant for the model folder's tabby_config.yml. For example:
+  # sampling:
+  #   override_preset: my_model_preset
+  #   temperature:
+  #     override: 0.5
+  #     force: false
+  sampling:
+
+  # Warm up the model after loading (default: False).
+  # Runs a short schedule of forward passes so kernel compilation, autotuning and CUDA graph
+  # capture happen at load time instead of on the first requests. Adds some seconds to loading;
+  # sized from the cache, batch and chunk settings in effect.
+  warmup: false
 
   # Keep the vision model's weights in system RAM instead of VRAM (default: False).
   # Weights are stored in pinned host memory and streamed to the GPU during inference,
@@ -210,15 +280,19 @@ model:
   # as an alias for {enable_thinking: true}.
   template_vars_force: {}
 
-  # Enable reasoning parser (default: False).
-  # Do NOT enable this if the model is not a reasoning model (e.g. deepseek-r1 series)
-  reasoning: false
+  # Enable the reasoning parser (default: True).
+  # Splits the response into reasoning_content and content fields. With the tokens below
+  # left at auto, reasoning is only parsed when the model's template or tokenizer shows
+  # which tags it uses.
+  reasoning: true
 
-  # The start token for reasoning content (default: "<think>")
-  reasoning_start_token: "<think>"
+  # Start token for the reasoning parser (default: auto).
+  # auto takes the tags from the detected tool format or the chat template; set both
+  # tokens explicitly (e.g. "<think>" and "</think>") to override.
+  reasoning_start_token: auto
 
-  # The end token for reasoning content (default: "</think>")
-  reasoning_end_token: "</think>"
+  # End token for the reasoning parser (default: auto).
+  reasoning_end_token: auto
 
   # Whether generation starts inside a reasoning block (default: auto).
   # Options: auto, always, never
@@ -232,8 +306,14 @@ model:
   # Default reasoning token budget (default: None).
   # When a request's reasoning content exceeds the budget, the server forces the end of
   # the reasoning phase by injecting reasoning_budget_message followed by the model's
-  # end-of-reasoning tokens. 0 ends reasoning as soon as it starts; None or a negative
-  # value disables the budget. Overridable per request via reasoning_budget_tokens
+  # end-of-reasoning tokens. With a supporting engine, the initial single-token
+  # reasoning format uses an accepted-token producer boundary. An open tool call or
+  # partial tag defers injection; max_tokens still bounds the entire response.
+  # Other formats, continued messages and older engines use a best-effort boundary
+  # that can overshoot with queued/speculative tokens. 0 requests an immediate end;
+  # None or a negative value disables the default budget. Supported engines still
+  # guard the natural phase transition when its grammar/sampler settings differ;
+  # this imposes no reasoning cutoff. Overridable per request via reasoning_budget_tokens
   # (aliases: reasoning_budget, thinking_budget, thinking_token_budget) or
   # reasoning.max_tokens. Requires a reasoning format: reasoning tags, Harmony or Muse Glimmer.
   reasoning_budget_tokens:
@@ -243,9 +323,11 @@ model:
   # per request via reasoning_budget_message.
   reasoning_budget_message:
 
-  # Tool format, e.g. 'qwen3_coder'. See docs for supported formats. If left blank,
-  # tool calls from the model will not be parsed by the server.
-  tool_format:
+  # Tool call format (default: auto).
+  # auto picks a parser from the model's chat template, tokenizer and architecture, and warns
+  # if none matches. Set a format name, e.g. 'qwen3_coder', to override; see the Tool Calling
+  # docs for the supported formats. Leave blank to disable tool call parsing.
+  tool_format: auto
 
   # Parse responses in the Harmony message format (gpt-oss models).
   # Auto-detected from the model's special tokens by default; set to true or false
@@ -313,8 +395,28 @@ sampling:
   # Find this in the sampler-overrides folder.
   # This overrides default fallbacks for sampler values that are passed to the API.
   # NOTE: safe_defaults is noob friendly and provides fallbacks for frontends that don't send sampling parameters.
-  # Remove this for any advanced usage.
+  # for frontends that don't send sampling parameters. Leaving this blank means no fallbacks at all.
   override_preset: safe_defaults
+
+  # Individual overrides can also be written directly in this section, using the same
+  # syntax as a preset file. They apply on top of override_preset, or on their own if
+  # no preset is given. For example:
+  # temperature:
+  #   override: 0.5
+  #   force: false
+  # min_p:
+  #   override: 0.1
+  #   force: true
+
+  # Settings nested under reasoning_override apply only while a model is reasoning;
+  # the response after the reasoning block uses the regular ones. Anything not listed
+  # is the same in both. Covers the sampler settings and banned_strings. For example:
+  # reasoning_override:
+  #   temperature:
+  #     override: 1.5
+  #     force: true
+  #   banned_strings:
+  #     override: ["but wait,"]
 
 # Options for Loras
 lora:
@@ -352,11 +454,17 @@ memory:
   # Size of system memory second-tier K/V cache, in MB (default: 0)
   sysmem_kv_cache: 0
 
-  # Use cudaMallocAsync backend in Torch (default: True).
-  # Enabling this is generally preferable, but it may cause issues with certain
-  # workloads. Try disabling it if you experience intermittent OoM errors. If
-  # False, Torch will use the allocator defined by the system env
-  cuda_malloc_async: True
+  # Size of the image embedding cache in system memory, in MB (default: 1024).
+  # Encoded images are kept so repeated turns of a conversation don't re-run the vision model.
+  # Images already in use by a request are never evicted; a context whose images exceed the
+  # budget is cached only partially, with a warning. Only applies when vision is enabled.
+  sysmem_multimodal_cache: 1024
+
+  # Use the cudaMallocAsync allocator backend in Torch (default: False).
+  # When False, the allocator is left to the environment: unless PYTORCH_CUDA_ALLOC_CONF is set,
+  # ExLlamaV3 enables expandable segments in Torch's native allocator, which performs better
+  # than cudaMallocAsync. Enable this to force the cudaMallocAsync backend instead.
+  cuda_malloc_async: false
 
 # Options for development and experimentation
 developer:

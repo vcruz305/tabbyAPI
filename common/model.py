@@ -13,7 +13,9 @@ from common.errors import ContextLengthExceededError, ContextLengthHTTPException
 from common.logger import get_loading_progress_bar
 from common.multimodal import MultimodalEmbeddingWrapper
 from common.networking import handle_request_error
+from common import sampling
 from common.sampling import BaseSamplerRequest
+from common.status_display import status_display
 from common.tabby_config import config
 from common.optional_dependencies import dependencies
 from common.transformers_utils import HFModel
@@ -48,6 +50,7 @@ class ModelType(Enum):
     MODEL = "model"
     DRAFT = "draft"
     VISION = "vision"
+    WARMUP = "warmup"
 
 
 def load_progress(module, modules):
@@ -141,6 +144,7 @@ async def unload_model(skip_wait: bool = False, shutdown: bool = False):
 
     await container.unload(skip_wait=skip_wait, shutdown=shutdown)
     container = None
+    sampling.clear_model_overrides()
 
 
 async def load_model_gen(model_path: pathlib.Path, **kwargs):
@@ -190,6 +194,18 @@ async def load_model_gen(model_path: pathlib.Path, **kwargs):
         # Check model compatibility and dependencies before creating a container
         validate_backend(kwargs.get("backend"), hf_model)
 
+        # Check the model's own sampling section before the expensive load, so
+        # a bad preset name or malformed inline entry fails here rather than
+        # after the weights are in VRAM
+        sampler_preset, sampler_inline = sampling.split_sampling_section(
+            kwargs.get("sampling"), "the model's sampling config"
+        )
+        if sampler_preset and sampling.resolve_preset_path(sampler_preset) is None:
+            raise ValueError(
+                f'Sampler override preset "{sampler_preset}" (model sampling section) was '
+                "not found in the sampler_overrides folder."
+            )
+
         new_container = await ExllamaV3Container.create(model_path.resolve(), hf_model, **kwargs)
 
         # Add possible types of models that can be loaded
@@ -201,34 +217,48 @@ async def load_model_gen(model_path: pathlib.Path, **kwargs):
         if new_container.use_vision:
             model_type.insert(0, ModelType.VISION)
 
+        # Warmup runs after the weights are loaded and reports its own progress
+        if getattr(new_container, "warmup_enabled", False):
+            model_type.append(ModelType.WARMUP)
+
         load_status = new_container.load_gen(load_progress, **kwargs)
 
-        progress = get_loading_progress_bar()
-        progress.start()
+        # The live status line must not be showing while the loading bars run
+        async with status_display.suspended():
+            progress = get_loading_progress_bar()
+            progress.start()
 
-        try:
-            index = 0
-            async for module, modules in load_status:
-                current_model_type = model_type[index].value
-                if module == 0:
-                    loading_task = progress.add_task(
-                        f"[cyan]Loading {current_model_type} modules", total=modules
-                    )
-                else:
-                    progress.advance(loading_task)
-
-                yield module, modules, current_model_type
-
-                if module == modules:
-                    # Switch to model progress if the draft model is loaded
-                    if index == len(model_type):
-                        progress.stop()
+            try:
+                index = 0
+                async for module, modules in load_status:
+                    current_model_type = model_type[index].value
+                    if module == 0:
+                        description = (
+                            "[cyan]Warming up"
+                            if current_model_type == ModelType.WARMUP.value
+                            else f"[cyan]Loading {current_model_type} modules"
+                        )
+                        loading_task = progress.add_task(description, total=modules)
                     else:
-                        index += 1
+                        progress.advance(loading_task)
 
-            container = new_container
-        finally:
-            progress.stop()
+                    yield module, modules, current_model_type
+
+                    if module == modules:
+                        # Move on to the next component; the last one ends the bars
+                        index += 1
+                        if index == len(model_type):
+                            progress.stop()
+
+                container = new_container
+            finally:
+                progress.stop()
+
+        # Sampler overrides for this model, replacing the previous model's layer
+        if sampler_preset or sampler_inline:
+            await sampling.set_model_overrides(sampler_preset, sampler_inline)
+        else:
+            sampling.clear_model_overrides()
 
 
 async def load_model(model_path: pathlib.Path, **kwargs):

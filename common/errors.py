@@ -6,6 +6,18 @@ class ContextLengthExceededError(ValueError):
     """Raised when a tokenized prompt exceeds the loaded model's context limit."""
 
 
+class ToolCallParseError(ValueError):
+    """The model stopped after emitting an invalid or incomplete tool call."""
+
+
+class GrammarParseError(ValueError):
+    """Raised when a requested json_schema, regex, or grammar fails to compile.
+
+    Constrained decoding refuses to fall back to unconstrained generation, so
+    the request is rejected instead of silently served without the constraint.
+    """
+
+
 class ContextLengthHTTPException(HTTPException):
     """HTTP error for OpenAI-compatible context overflow responses."""
 
