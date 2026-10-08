@@ -280,9 +280,9 @@ class QwenToolCallDeltaStreamer:
                     )
                 self._keys.add(self._param_key)
                 self._reset_value()
-                self._value_is_string = self.schemas.is_string(
-                    self._names[self._index], self._param_key
-                )
+                types = self.schemas.types(self._names[self._index], self._param_key)
+                self._value_is_string = types == {"string"}
+                self._value_allows_string = "string" in types
                 self._state = self._VALUE
 
         return deltas
@@ -294,6 +294,7 @@ class QwenToolCallDeltaStreamer:
         self._sent_parts: list[str] = []
         self._streaming = False
         self._value_is_string = False
+        self._value_allows_string = False
         self._value_started = False
         self._string_tail = ""
         self._pending_whitespace: list[str] = []
@@ -311,24 +312,25 @@ class QwenToolCallDeltaStreamer:
         self._sent_parts.append(text)
         self._emit(deltas, self._arg_fragment(fragment))
 
+    def _consume_string_text(self, text: str, deltas: list):
+        # normalize_string removes exactly one initial/final LF. Only the
+        # possible final LF needs holdback; spaces, indentation and CR are data.
+        if not self._value_started:
+            self._value_started = True
+            text = text.removeprefix("\n")
+        text = self._string_tail + text
+        self._string_tail = "\n" if text.endswith("\n") else ""
+        if self._string_tail:
+            text = text[:-1]
+        self._stream_text(text, deltas)
+
     def _consume_value(self, text: str, deltas: list):
         if not text:
             return
         self._raw_parts.append(text)
 
         if self._value_is_string:
-            # normalize_string removes exactly one initial/final LF. Only the
-            # possible final LF needs holdback; spaces, indentation and CR are
-            # data. Work on each new piece instead of re-stripping the entire
-            # accumulated value on every token.
-            if not self._value_started:
-                self._value_started = True
-                text = text.removeprefix("\n")
-            text = self._string_tail + text
-            self._string_tail = "\n" if text.endswith("\n") else ""
-            if self._string_tail:
-                text = text[:-1]
-            self._stream_text(text, deltas)
+            self._consume_string_text(text, deltas)
             return
 
         if self._streaming:
@@ -359,9 +361,13 @@ class QwenToolCallDeltaStreamer:
             return
         if interior_whitespace or _is_streamable(candidate):
             raw = "".join(self._raw_parts)
-            self._stream_text(raw.strip(), deltas)
-            tail = raw[len(raw.rstrip()) :]
-            self._pending_whitespace = [tail] if tail else []
+            if self._value_allows_string:
+                self._value_is_string = True
+                self._consume_string_text(raw, deltas)
+            else:
+                self._stream_text(raw.strip(), deltas)
+                tail = raw[len(raw.rstrip()) :]
+                self._pending_whitespace = [tail] if tail else []
         elif candidate[0] in _JSONY_START:
             self._json_value = True
         else:

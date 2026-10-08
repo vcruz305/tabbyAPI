@@ -207,9 +207,12 @@ def _compose_serialize_stream_chunk(
     delta_content = generation.get("delta_content")
     delta_reasoning_content = generation.get("delta_reasoning_content")
     delta_tool = generation.get("delta_tool_calls")
+    delta_role = generation.get("delta_role")
     logprobs = generation.get("logprob_response")
 
     delta = {}
+    if delta_role:
+        delta["role"] = delta_role
     if delta_content:
         delta["content"] = delta_content
     if delta_reasoning_content:
@@ -608,6 +611,7 @@ def _parse_tool_calls(
     tools=None,
     streaming: bool = True,
     max_calls: Optional[int] = None,
+    strict: bool = False,
 ) -> list:
     """
     Parse collected tool calls and convert to OAI format.
@@ -616,7 +620,7 @@ def _parse_tool_calls(
     calls omit the streaming-only index field.
     """
 
-    parsed = parse_toolcalls(text, tool_format, tools=tools)
+    parsed = parse_toolcalls(text, tool_format, tools=tools, strict=strict)
     if max_calls is not None:
         parsed = parsed[:max_calls]
     for tc_idx, p in enumerate(parsed):
@@ -786,6 +790,10 @@ async def _chat_stream_collector(
     collected_logprobs = []
 
     try:
+        if streaming_mode:
+            # SDKs build the final assistant message from deltas, so every
+            # choice needs its role even if it emits only tools or no text.
+            await gen_queue.put({"index": task_idx, "delta_role": "assistant"})
         new_generation = mc.stream_generate(
             request_id,
             prompt,
@@ -863,6 +871,10 @@ async def _chat_stream_collector(
                 collected_logprobs += generation["logprobs_content"]
 
             parsed_calls = []
+            if finish_reason == "stop" and use_tool and parser.in_tool:
+                raise ToolCallParseError(
+                    "The model stopped inside a tool call wrapper or function."
+                )
             if finish_reason and full_tool:
                 parsed_calls = _parse_tool_calls(
                     full_tool,
@@ -870,6 +882,7 @@ async def _chat_stream_collector(
                     label,
                     tools=params.tools or params.functions,
                     streaming=streaming_mode,
+                    strict=finish_reason == "stop",
                     max_calls=(
                         1 if params.parallel_tool_calls is False and not forced_choice else None
                     ),

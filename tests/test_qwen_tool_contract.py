@@ -74,6 +74,35 @@ class QwenSchemaTests(unittest.TestCase):
             {"i": 3, "n": 1.5, "b": True, "a": [1, "2"], "o": {"n": False}, "z": None},
         )
 
+    def test_string_unions_reject_forbidden_coercions_and_preserve_text(self):
+        cases = [
+            (["string", "null"], "null", None),
+            (["string", "null"], "123", "123"),
+            (["string", "null"], "true", "true"),
+            (["string", "null"], "[1,2]", "[1,2]"),
+            (["string", "null"], '{"n":1}', '{"n":1}'),
+            (["string", "null"], '"quoted"', '"quoted"'),
+            (["string", "null"], "    return 1\n", "    return 1\n"),
+            (["string", "null"], "\ttruex\r\n", "\ttruex\r\n"),
+            (["string", "integer"], "123", 123),
+            (["string", "integer"], "1.5", "1.5"),
+            (["string", "integer"], "true", "true"),
+            (["string", "object"], '{"n":1}', {"n": 1}),
+            (["string", "object"], "[1,2]", "[1,2]"),
+            (["string", "object"], "null", "null"),
+        ]
+        for types, value, expected in cases:
+            declarations = tools({"text": {"type": types}})
+            raw = xml(params=[("text", value)])
+            parsed = qwen3_coder.parse_toolcalls(raw, tools=declarations)
+            self.assertEqual(json.loads(parsed[0].function.arguments), {"text": expected})
+            for split in range(len(raw) + 1):
+                with self.subTest(types=types, value=value, split=split):
+                    stream = QwenToolCallDeltaStreamer(tools=declarations)
+                    deltas = stream.feed(raw[:split]) + stream.feed(raw[split:])
+                    args = "".join(d["function"].get("arguments", "") for d in deltas)
+                    self.assertEqual(json.loads(args), {"text": expected})
+
     def test_local_refs_and_string_enums(self):
         declarations = tools(
             {
@@ -199,6 +228,38 @@ class QwenCollectorTests(unittest.IsolatedAsyncioTestCase):
             frames, result = await run_collector(mc, make_request(), streaming=stream)
             final = frames[-1] if stream else result
             self.assertIsInstance(final, ToolCallParseError)
+
+    async def test_incomplete_trailing_calls_fail_equally_in_both_modes(self):
+        prefix = xml("get_weather", [("city", "Paris")])
+        tails = [
+            "<tool_call><function=get_weather><parameter=city>London",
+            "<tool_call><function=get_weather><parameter=city>London</parameter></tool_call>",
+            "<tool_call>",
+            "<tool_call></tool_call>",
+            "<function=get_weather",
+            "<tool_call><function=get_weather><function=get_weather></function></tool_call>",
+        ]
+        for tail in tails:
+            for stream in [False, True]:
+                for choice in ["auto", "required"]:
+                    for finish in ["stop", "length"]:
+                        with self.subTest(tail=tail, stream=stream, choice=choice, finish=finish):
+                            mc = make_mc([])
+
+                            async def backend(*args, **kwargs):
+                                for chunk in pieces(prefix + tail, 3):
+                                    yield {"text": chunk}
+                                yield {"text": "", "finish_reason": finish}
+
+                            mc.stream_generate = backend
+                            frames, result = await run_collector(
+                                mc, make_request(tool_choice=choice), streaming=stream
+                            )
+                            final = frames[-1] if stream else result
+                            if finish == "stop":
+                                self.assertIsInstance(final, ToolCallParseError)
+                            else:
+                                self.assertEqual(final.get("finish_reason"), "length")
 
     async def test_length_finish_is_preserved_for_partial_call(self):
         for stream in [False, True]:

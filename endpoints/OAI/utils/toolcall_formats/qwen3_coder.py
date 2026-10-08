@@ -9,6 +9,7 @@ ambiguous in this wire format and cannot be reconstructed by a parser.
 import json
 import re
 
+from common.errors import ToolCallParseError
 from common.logger import xlogger
 from endpoints.OAI.types.tools import ToolCall, Tool
 from endpoints.OAI.utils.toolcall_formats.common import FormatSignature
@@ -118,22 +119,59 @@ class ToolSchemas:
         return self.types(function, parameter) == {"string"}
 
     def coerce(self, raw: str, function: str, parameter: str):
-        if self.is_string(function, parameter):
+        types = self.types(function, parameter)
+        if types == {"string"}:
             return normalize_string(raw)
-        return coerce_value(raw)
+        value = coerce_value(raw)
+        if "string" in types:
+            # For a string union, only decode non-string JSON when its type
+            # is actually allowed. Qwen writes strings raw, so a string branch
+            # preserves quotes, indentation and final line breaks as data.
+            value_types = set()
+            if value is None:
+                value_types = {"null"}
+            elif isinstance(value, bool):
+                value_types = {"boolean"}
+            elif isinstance(value, int):
+                value_types = {"integer", "number"}
+            elif isinstance(value, float):
+                value_types = {"number"}
+                if value.is_integer():
+                    value_types.add("integer")
+            elif isinstance(value, list):
+                value_types = {"array"}
+            elif isinstance(value, dict):
+                value_types = {"object"}
+            if not types.intersection(value_types):
+                return normalize_string(raw)
+        return value
 
 
-def parse_toolcalls(text: str, tools=None) -> list[ToolCall]:
+def parse_toolcalls(text: str, tools=None, strict: bool = False) -> list[ToolCall]:
     """Parse complete function blocks without interpreting markup in values.
 
     Incomplete functions or parameters are never converted into empty calls.
     The outer wrapper is optional; the same parser handles wrapped and bare
-    function blocks. No generated text is evaluated or executed.
+    function blocks. With strict=True, incomplete trailing calls and empty
+    wrappers raise rather than silently returning only a completed prefix.
+    No generated text is evaluated or executed.
     """
     schemas = tools if isinstance(tools, ToolSchemas) else ToolSchemas(tools)
     results = []
     position = 0
-    while function := _FUNC_OPEN.search(text, position):
+    while True:
+        function = _FUNC_OPEN.search(text, position)
+        if strict:
+            gap = text[position : function.start() if function else len(text)]
+            wrapper = gap.find(TOOLCALL_START)
+            if wrapper >= 0 and gap.find(TOOLCALL_END, wrapper) >= 0:
+                raise ToolCallParseError(
+                    "The model emitted a tool wrapper without a function call."
+                )
+            if "<function=" in gap:
+                raise ToolCallParseError("The model stopped inside a tool function header.")
+        if function is None:
+            break
         name = function.group(1)
         position = function.end()
         args = {}
@@ -141,6 +179,20 @@ def parse_toolcalls(text: str, tools=None) -> list[ToolCall]:
         while position < len(text):
             parameter = _PARAM_OPEN.search(text, position)
             close = text.find(_FUNC_CLOSE, position)
+            if strict:
+                # Skip parameter bodies wholesale before looking for structure,
+                # so literal wrapper/function tags inside code remain data.
+                next_structure = min(
+                    [p for p in (parameter.start() if parameter else -1, close) if p >= 0],
+                    default=len(text),
+                )
+                barriers = [
+                    text.find(tag, position) for tag in ("<function=", TOOLCALL_START, TOOLCALL_END)
+                ]
+                if any(0 <= barrier < next_structure for barrier in barriers):
+                    raise ToolCallParseError(
+                        "The model emitted an unclosed or nested tool function."
+                    )
             if parameter is not None and (close < 0 or parameter.start() < close):
                 parameter_end = text.find(_PARAM_CLOSE, parameter.end())
                 if parameter_end < 0:
@@ -156,6 +208,8 @@ def parse_toolcalls(text: str, tools=None) -> list[ToolCall]:
             else:
                 break
         if not complete:
+            if strict:
+                raise ToolCallParseError("The model stopped inside a tool function or parameter.")
             break
         results.append(
             ToolCall(
