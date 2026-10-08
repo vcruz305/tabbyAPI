@@ -6,6 +6,10 @@ class ContextLengthExceededError(ValueError):
     """Raised when a tokenized prompt exceeds the loaded model's context limit."""
 
 
+class ToolCallParseError(ValueError):
+    """The model stopped after emitting an invalid or incomplete tool call."""
+
+
 class GrammarParseError(ValueError):
     """Raised when a requested json_schema, regex, or grammar fails to compile.
 

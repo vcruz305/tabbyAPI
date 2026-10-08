@@ -44,7 +44,6 @@ from uuid import uuid4
 
 from common.logger import xlogger
 from endpoints.OAI.utils.toolcall_formats import qwen3_coder
-from endpoints.OAI.utils.toolcall_formats.common import coerce_param_value
 
 _FUNC_OPEN = re.compile(r"<function=([^>\s]+)[^>]*>")
 _PARAM_OPEN = re.compile(r"<parameter=([^>\s]+)[^>]*>")
@@ -99,7 +98,10 @@ class QwenToolCallDeltaStreamer:
     _OUT = 0
     _VALUE = 1
 
-    def __init__(self):
+    def __init__(self, tools=None, max_calls=None):
+        self.schemas = qwen3_coder.ToolSchemas(tools)
+        self.max_calls = max_calls
+        self.completed = 0
         self.emitted = False
 
         self._state = self._OUT
@@ -145,6 +147,8 @@ class QwenToolCallDeltaStreamer:
         return {"index": self._index, "function": {"arguments": fragment}}
 
     def _emit(self, deltas: list, delta: dict):
+        if self.max_calls is not None and delta["index"] >= self.max_calls:
+            return
         self.emitted = True
 
         # Merge consecutive fragments for the same index into one entry so a
@@ -248,6 +252,7 @@ class QwenToolCallDeltaStreamer:
                     continue
                 self._emit(deltas, self._arg_fragment("}"))
                 self._in_func = False
+                self.completed += 1
                 self._state = self._OUT
             elif not self._in_func:
                 # A parameter outside a function block is dropped by the
@@ -279,8 +284,12 @@ class QwenToolCallDeltaStreamer:
         self._raw += text
 
         if not self._streaming:
-            stripped = self._raw.strip()
-            if stripped and _is_streamable(stripped):
+            is_string = self.schemas.is_string(self._names[self._index], self._param_key)
+            stripped = qwen3_coder.normalize_string(self._raw) if is_string else self._raw.strip()
+            # Hold a CR that may still complete a template CRLF.
+            if is_string and stripped.endswith("\r"):
+                stripped = stripped[:-1]
+            if stripped and (is_string or _is_streamable(stripped)):
                 self._streaming = True
                 self._sent = stripped
                 self._emit(deltas, self._arg_fragment(self._param_prefix() + '"' + _esc(stripped)))
@@ -289,7 +298,10 @@ class QwenToolCallDeltaStreamer:
         # Streaming: the stripped prefix of the raw value grows monotonically;
         # trailing whitespace stays unemitted until later text makes it
         # interior, matching the strip() applied by the end-of-stream parser.
-        candidate = self._raw.strip()
+        is_string = self.schemas.is_string(self._names[self._index], self._param_key)
+        candidate = qwen3_coder.normalize_string(self._raw) if is_string else self._raw.strip()
+        if is_string and candidate.endswith("\r"):
+            candidate = candidate[:-1]
         new = candidate[len(self._sent) :]
         if new:
             self._sent = candidate
@@ -297,9 +309,17 @@ class QwenToolCallDeltaStreamer:
 
     def _close_param(self, deltas: list):
         if self._streaming:
+            value = self.schemas.coerce(self._raw, self._names[self._index], self._param_key)
+            if value.startswith(self._sent) and len(value) > len(self._sent):
+                self._emit(deltas, self._arg_fragment(_esc(value[len(self._sent) :])))
+                self._sent = value
             # Close the JSON string. The streamed content must equal the
             # stripped raw value; guard against any drift.
-            final = json.dumps(self._raw.strip(), ensure_ascii=False)
+            final = json.dumps(
+                self.schemas.coerce(self._raw, self._names[self._index], self._param_key),
+                ensure_ascii=False,
+                allow_nan=False,
+            )
             streamed = '"' + _esc(self._sent) + '"'
             if final != streamed:
                 xlogger.error(
@@ -308,7 +328,7 @@ class QwenToolCallDeltaStreamer:
                 )
             self._emit(deltas, self._arg_fragment('"'))
         else:
-            value = coerce_param_value(self._raw)
+            value = self.schemas.coerce(self._raw, self._names[self._index], self._param_key)
             self._emit(
                 deltas,
                 self._arg_fragment(self._param_prefix() + json.dumps(value, ensure_ascii=False)),
@@ -333,7 +353,7 @@ class QwenToolCallDeltaStreamer:
         """
 
         try:
-            authoritative = qwen3_coder.parse_toolcalls(full_tool)
+            authoritative = qwen3_coder.parse_toolcalls(full_tool, tools=self.schemas)
             # strict=False: a length mismatch here is itself a divergence,
             # and is reported by the comparison below rather than raised here
             mine = list(zip(self._names, self._assembled, strict=False))

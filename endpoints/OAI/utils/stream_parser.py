@@ -152,6 +152,11 @@ class TagStreamParser:
         calls may occur inside reasoning content.
         """
 
+        if self.in_tool and tag in (self.reasoning_start, self.reasoning_end):
+            # Tags in tool arguments (e.g. code for write_file) are literal data.
+            events.append((TOOL, tag))
+            return
+
         if not self.in_tool:
             if tag == self.reasoning_start:
                 self.in_reasoning = True
@@ -175,6 +180,76 @@ class TagStreamParser:
         elif tag == self.tool_end:
             events.append((TOOL, tag))
             self.in_tool = False
+
+
+class Qwen3CoderStreamParser(TagStreamParser):
+    """Qwen XML routing with parameter values protected from outer tags.
+
+    Function blocks can be bare or wrapped in <tool_call>. Within a parameter,
+    every tag except </parameter> is literal data, including reasoning tags,
+    function closes, and tool wrappers. This state survives arbitrary chunks.
+    """
+
+    _FUNCTION_START = "<function="
+    _FUNCTION_END = "</function>"
+    _PARAMETER_START = "<parameter="
+    _PARAMETER_END = "</parameter>"
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self._in_parameter = False
+        self._wrapped = False
+        self._tags += [
+            self._FUNCTION_START,
+            self._FUNCTION_END,
+            self._PARAMETER_START,
+            self._PARAMETER_END,
+        ]
+        self._tags.sort(key=len, reverse=True)
+        self._tag_re = re.compile("|".join(re.escape(t) for t in self._tags))
+        self._max_hold = max(len(t) - 1 for t in self._tags)
+        self._tag_first = frozenset(t[0] for t in self._tags)
+
+    def _handle_tag(self, tag: str, events: list):
+        if self.in_tool and self._in_parameter:
+            if tag == self._PARAMETER_END:
+                self._in_parameter = False
+            events.append((TOOL, tag))
+            return
+
+        if tag == self._PARAMETER_START and self.in_tool:
+            self._in_parameter = True
+            events.append((TOOL, tag))
+            return
+
+        if tag == self._FUNCTION_START and not self.in_tool:
+            if self.in_reasoning and not self.tool_calls_in_reasoning:
+                events.append((REASONING, tag))
+                return
+            self._wrapped = False
+            self.in_tool = True
+            events.append((TOOL, tag))
+            return
+
+        if tag == self._FUNCTION_END and self.in_tool and not self._wrapped:
+            events.append((TOOL, tag))
+            self.in_tool = False
+            return
+
+        if tag in (
+            self._FUNCTION_START,
+            self._FUNCTION_END,
+            self._PARAMETER_START,
+            self._PARAMETER_END,
+        ):
+            self._route(tag, events)
+            return
+
+        if tag == self.tool_start and not (self.in_reasoning and not self.tool_calls_in_reasoning):
+            self._wrapped = True
+        elif tag == self.tool_end:
+            self._wrapped = False
+        super()._handle_tag(tag, events)
 
 
 class ChannelStreamParser:

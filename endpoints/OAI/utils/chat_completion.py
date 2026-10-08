@@ -42,6 +42,7 @@ from endpoints.OAI.utils.stream_parser import (
     GlimmerStreamParser,
     HarmonyStreamParser,
     TagStreamParser,
+    Qwen3CoderStreamParser,
 )
 from endpoints.OAI.utils.tools import (
     get_toolcall_tags,
@@ -50,6 +51,7 @@ from endpoints.OAI.utils.tools import (
 )
 from endpoints.OAI.utils.common_ import aggregate_usage_stats, get_timings, get_usage_stats
 from endpoints.OAI.utils.toolcall_stream import QwenToolCallDeltaStreamer
+from common.errors import ToolCallParseError
 
 
 def _start_in_reasoning_mode(prompt: str, user_suffix_len: int = 0) -> bool:
@@ -506,7 +508,7 @@ async def apply_chat_template(data: ChatCompletionRequest):
     normalize_message_roles(data)
 
     # Locally store tools dict
-    tools = data.model_dump()["tools"]
+    tools = data.model_dump()["tools"] if data.tool_choice != "none" else None
 
     try:
         data.template_vars = resolve_template_vars(data, model.container)
@@ -514,7 +516,13 @@ async def apply_chat_template(data: ChatCompletionRequest):
             {
                 "add_generation_prompt": data.add_generation_prompt,
                 "tools": tools,
-                "functions": data.functions,
+                "functions": data.functions if data.tool_choice != "none" else None,
+                "tool_choice": (
+                    data.tool_choice.model_dump()
+                    if hasattr(data.tool_choice, "model_dump")
+                    else data.tool_choice
+                ),
+                "parallel_tool_calls": data.parallel_tool_calls,
             }
         )
 
@@ -575,19 +583,23 @@ def _parse_tool_calls(
     text: str,
     tool_format: str,
     label: str,
+    tools=None,
+    streaming: bool = True,
+    max_calls: Optional[int] = None,
 ) -> list:
     """
     Parse collected tool calls and convert to OAI format.
 
-    Insert tool indices as well. (These are not choice indices; OAI enumerates the tool
-    calls within each individual choice for the sake of streaming incomplete tool arg
-    deltas, which we don't do here.)
+    Add per-choice tool indices only to streaming responses. Non-streaming
+    calls omit the streaming-only index field.
     """
 
-    parsed = parse_toolcalls(text, tool_format)
+    parsed = parse_toolcalls(text, tool_format, tools=tools)
+    if max_calls is not None:
+        parsed = parsed[:max_calls]
     for tc_idx, p in enumerate(parsed):
-        p.index = tc_idx
-    dumped = [p.model_dump(mode="json") for p in parsed]
+        p.index = tc_idx if streaming else None
+    dumped = [p.model_dump(mode="json", exclude_none=True) for p in parsed]
 
     if len(parsed):
         num = len(parsed)
@@ -658,8 +670,8 @@ async def _chat_stream_collector(
     choice.
 
     In streaming mode, emits chunks of text to be emitted as deltas to the client, divided into
-    reasoning/content/tool phases. Tool calls are parsed together at the end of stream, so the
-    last chunk contains all tool calls collected for the turn.
+    reasoning/content/tool phases. Qwen calls stream incremental argument
+    fragments; other formats are collected and parsed on the final chunk.
 
     In non-streaming mode, collects everything with the same logic but then emits a single
     response packet at the end, to be combined with any other choices (for n>1 requests) and
@@ -688,11 +700,20 @@ async def _chat_stream_collector(
     else:
         tool_format = mc.tool_format
         t_tool_start, t_tool_end = get_toolcall_tags(tool_format)
-        use_tool = params.tool_choice != "none" and bool(t_tool_start)
+        use_tool = (
+            params.tool_choice != "none"
+            and bool(params.tools or params.functions)
+            and bool(t_tool_start)
+        )
 
         use_think = mc.reasoning and bool(mc.reasoning_start_token)
 
-        parser = TagStreamParser(
+        parser_type = (
+            Qwen3CoderStreamParser
+            if use_tool and supports_delta_streaming(tool_format)
+            else TagStreamParser
+        )
+        parser = parser_type(
             reasoning_start=mc.reasoning_start_token if use_think else None,
             reasoning_end=mc.reasoning_end_token if use_think else None,
             tool_start=t_tool_start if use_tool else None,
@@ -707,7 +728,10 @@ async def _chat_stream_collector(
     # fallback whenever the streamer produced nothing.
     tool_streamer = None
     if streaming_mode and use_tool and supports_delta_streaming(tool_format):
-        tool_streamer = QwenToolCallDeltaStreamer()
+        tool_streamer = QwenToolCallDeltaStreamer(
+            tools=params.tools or params.functions,
+            max_calls=1 if params.parallel_tool_calls is False else None,
+        )
 
     # Reasoning budget: when the reasoning phase exceeds the budget, force
     # end-of-reasoning tokens into the output stream so the model answers
@@ -764,21 +788,27 @@ async def _chat_stream_collector(
 
             delta_reasoning = ""
             delta_content = ""
-            tool_deltas: list = []
+            output_events: list = []
             for channel, sub in events:
                 if channel == REASONING:
                     delta_reasoning += sub
                     full_reasoning += sub
+                    if streaming_mode and sub:
+                        output_events.append({"delta_reasoning_content": sub})
                 elif channel == CONTENT:
                     if strip_content_lead:
                         sub = sub.lstrip()
                         strip_content_lead = not sub
                     delta_content += sub
                     full_content += sub
+                    if streaming_mode and sub:
+                        output_events.append({"delta_content": sub})
                 else:
                     full_tool += sub
                     if tool_streamer is not None:
-                        tool_deltas.extend(tool_streamer.feed(sub))
+                        tool_deltas = tool_streamer.feed(sub)
+                        if tool_deltas:
+                            output_events.append({"delta_tool_calls": tool_deltas})
 
             if parser.in_reasoning != phase_applied and not finish_reason:
                 # Retried on the next chunk if the backend can't switch yet
@@ -806,41 +836,55 @@ async def _chat_stream_collector(
             if "logprobs_content" in generation and not parser.saw_tag and parser.in_content:
                 collected_logprobs += generation["logprobs_content"]
 
-            # Add the output and emit
-            if streaming_mode:
-                # A chunk can span the end of the reasoning phase (merged
-                # generator results). Emit the reasoning tail as its own
-                # delta so no SSE frame carries both reasoning_content and
-                # content: clients treat the first content delta as the
-                # phase transition.
-                if delta_reasoning and delta_content:
-                    await gen_queue.put(
-                        {"index": task_idx, "delta_reasoning_content": delta_reasoning}
-                    )
-                    delta_reasoning = ""
-
-                if delta_content:
-                    if len(collected_logprobs):
-                        generation["logprob_response"] = ChatCompletionLogprobs(
-                            content=collected_logprobs
+            parsed_calls = []
+            if finish_reason and full_tool:
+                parsed_calls = _parse_tool_calls(
+                    full_tool,
+                    tool_format,
+                    label,
+                    tools=params.tools or params.functions,
+                    streaming=streaming_mode,
+                    max_calls=1 if params.parallel_tool_calls is False else None,
+                )
+                if finish_reason == "stop":
+                    if not parsed_calls:
+                        raise ToolCallParseError(
+                            "The model emitted tool markup but no complete tool call. "
+                            "Retry the request or inspect the model output."
                         )
-                        collected_logprobs = []
-                generation["delta_reasoning_content"] = delta_reasoning
-                generation["delta_content"] = delta_content
-                generation["delta_tool_calls"] = ""
-                if tool_deltas:
-                    await gen_queue.put({"index": task_idx, "delta_tool_calls": tool_deltas})
-                if finish_reason and full_tool:
-                    if tool_streamer is not None and tool_streamer.emitted:
-                        # Fragments were streamed; the client assembles the
-                        # calls itself, so only cross-check against the
-                        # authoritative parse and close the finish reason.
-                        tool_streamer.verify(full_tool, request_id)
-                    else:
-                        generation["delta_tool_calls"] = _parse_tool_calls(
-                            full_tool, tool_format, label
+                    if tool_streamer is not None and tool_streamer._in_func:
+                        raise ToolCallParseError(
+                            "The model stopped inside a tool call. Retry with a larger "
+                            "max_tokens budget or inspect the model output."
                         )
                     generation["finish_reason"] = "tool_calls"
+                # A token-budget stop remains length, even after partial tool deltas.
+                if streaming_mode:
+                    if tool_streamer is not None and tool_streamer.emitted:
+                        if finish_reason != "length":
+                            tool_streamer.verify(full_tool, request_id)
+                    elif parsed_calls:
+                        output_events.append({"delta_tool_calls": parsed_calls})
+
+            # Keep channel order even when one backend chunk contains reasoning,
+            # content and a tool call. Typical single-channel chunks still use
+            # one queue item; metrics and the finish reason ride on the last one.
+            if streaming_mode:
+                if delta_content and collected_logprobs:
+                    for event in reversed(output_events):
+                        if event.get("delta_content"):
+                            event["logprob_response"] = ChatCompletionLogprobs(
+                                content=collected_logprobs
+                            )
+                            collected_logprobs = []
+                            break
+                generation["delta_reasoning_content"] = ""
+                generation["delta_content"] = ""
+                generation["delta_tool_calls"] = ""
+                for event in output_events[:-1]:
+                    await gen_queue.put({"index": task_idx, **event})
+                if output_events:
+                    generation.update(output_events[-1])
                 await gen_queue.put(generation)
 
             # End
@@ -854,9 +898,7 @@ async def _chat_stream_collector(
                 generation["logprob_response"] = ChatCompletionLogprobs(content=collected_logprobs)
             generation["reasoning_content"] = full_reasoning
             generation["content"] = full_content if has_content else None
-            generation["tool_calls"] = _parse_tool_calls(full_tool, tool_format, label)
-            if full_tool:
-                generation["finish_reason"] = "tool_calls"
+            generation["tool_calls"] = parsed_calls
             return generation
 
     except Exception as e:
@@ -938,7 +980,7 @@ async def stream_generate_chat_completion(
             chunk, _, finish_reason, is_empty = _compose_serialize_stream_chunk(
                 request.state.id,
                 generation,
-                model_path.name,
+                data.model or model_path.name,
                 suppress_finish,
                 None if suppress_finish else timings,
             )
@@ -956,7 +998,7 @@ async def stream_generate_chat_completion(
                             aggregate_usage_stats(usage_stats_list),
                             generation["index"],
                             finish_reason,
-                            model_path.name,
+                            data.model or model_path.name,
                             timings,
                         )
                         yield usage_chunk
@@ -976,6 +1018,9 @@ async def stream_generate_chat_completion(
 
     except ContextLengthExceededError as exc:
         yield get_context_length_generator_error(str(exc))
+
+    except ToolCallParseError as exc:
+        yield get_generator_error(str(exc), exc_info=False)
 
     except GrammarParseError as exc:
         yield get_generator_error(str(exc), exc_info=False)
@@ -1042,7 +1087,9 @@ async def generate_chat_completion(
             if isinstance(r, Exception):
                 raise r
             generations.append(r)
-        response = _compose_response(request.state.id, generations, model_path.name, return_usage)
+        response = _compose_response(
+            request.state.id, generations, data.model or model_path.name, return_usage
+        )
 
         xlogger.debug(f"{request_tag(request)} chat completion finished", {"response": response})
         return response
@@ -1053,6 +1100,10 @@ async def generate_chat_completion(
     except ContextLengthExceededError as exc:
         error_message = handle_request_error(str(exc), exc_info=False).error.message
         raise ContextLengthHTTPException(error_message) from exc
+
+    except ToolCallParseError as exc:
+        error_message = handle_request_error(str(exc), exc_info=False).error.message
+        raise HTTPException(502, error_message) from exc
 
     except GrammarParseError as exc:
         error_message = handle_request_error(str(exc), exc_info=False).error.message

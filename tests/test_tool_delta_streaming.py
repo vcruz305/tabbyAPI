@@ -15,6 +15,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from endpoints.OAI.types.chat_completion import ChatCompletionMessage, ChatCompletionRequest
+from common.errors import ToolCallParseError
 from endpoints.OAI.utils import chat_completion as cc
 from endpoints.OAI.utils.toolcall_formats import qwen3_coder
 from endpoints.OAI.utils.tools import get_toolcall_tags
@@ -150,10 +151,7 @@ class StreamingDeltaWiringTests(unittest.IsolatedAsyncioTestCase):
 
         frames, _ = await run_collector(mc, make_request())
 
-        self.assertFalse([f for f in frames if f.get("delta_tool_calls")])
-        final = frames[-1]
-        self.assertEqual(final["finish_reason"], "tool_calls")
-        self.assertEqual(final["delta_tool_calls"], [])  # authoritative parse: none
+        self.assertIsInstance(frames[-1], ToolCallParseError)
 
     async def test_tool_choice_none_keeps_old_path(self):
         chunks = pieces(RS + "thinking" + RE) + pieces(tool_text())
