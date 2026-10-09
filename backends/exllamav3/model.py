@@ -1177,6 +1177,7 @@ class ExllamaV3Container:
             self.config = None
             self.cache = None
             self.tokenizer = None
+            self._literal_user_token_encoder = None
 
             if self.use_draft_model:
                 self.draft_model.unload()
@@ -1204,6 +1205,19 @@ class ExllamaV3Container:
                 async with self.load_condition:
                     self.load_condition.notify_all()
 
+    def prepare_literal_user_token_plan(self, prompt, spans):
+        from common.literal_user_tokens import LiteralUserTokenEncoder
+        encoder = getattr(self, "_literal_user_token_encoder", None)
+        if encoder is None or encoder.native_tokenizer is not self.tokenizer:
+            encoder = LiteralUserTokenEncoder(self.tokenizer)
+            self._literal_user_token_encoder = encoder
+        plan = encoder.prepare(prompt, spans)
+        # Verify the native backend mapping before the request reaches context
+        # accounting. Later consumers recheck the same request-local binding.
+        original = self.tokenizer.encode(prompt, add_bos=False, encode_special_tokens=True)
+        plan.apply(original, prompt, self.tokenizer)
+        return plan
+
     def encode_tokens(self, text: str, **kwargs) -> List[int]:
         """
         Encodes a string of text into a list of token IDs.
@@ -1219,16 +1233,18 @@ class ExllamaV3Container:
         mm_embeddings: MultimodalEmbeddingWrapper = kwargs.get("embeddings")
         mm_embeddings_content = mm_embeddings.content if mm_embeddings else []
 
-        return (
-            self.tokenizer.encode(
-                text,
-                add_bos=unwrap(kwargs.get("add_bos_token"), self.hf_model.add_bos_token()),
-                encode_special_tokens=unwrap(kwargs.get("encode_special_tokens"), True),
-                embeddings=mm_embeddings_content,
-            )
-            .flatten()
-            .tolist()
+        add_bos = unwrap(kwargs.get("add_bos_token"), self.hf_model.add_bos_token())
+        encoded = self.tokenizer.encode(
+            text,
+            add_bos=add_bos,
+            encode_special_tokens=unwrap(kwargs.get("encode_special_tokens"), True),
+            embeddings=mm_embeddings_content,
         )
+        plan = kwargs.get("literal_user_token_plan")
+        if plan is not None:
+            encoded = plan.apply(encoded, text, self.tokenizer, add_bos=add_bos,
+                                 embeddings=mm_embeddings_content)
+        return encoded.flatten().tolist()
 
     def decode_tokens(self, ids: List[int], **kwargs) -> str:
         """
@@ -1278,6 +1294,7 @@ class ExllamaV3Container:
                 prompt,
                 add_bos_token=unwrap(params.add_bos_token, self.hf_model.add_bos_token()),
                 embeddings=mm_embeddings,
+                literal_user_token_plan=getattr(params, "_literal_user_token_plan", None),
             )
         )
         max_tokens = unwrap(params.max_tokens, 0)
@@ -1793,6 +1810,13 @@ class ExllamaV3Container:
             )
             for prompt in prompts
         ]
+
+        literal_plan = getattr(params, "_literal_user_token_plan", None)
+        if literal_plan is not None:
+            input_ids = [literal_plan.apply(ids, text, self.tokenizer,
+                                            add_bos=add_bos_token,
+                                            embeddings=mm_embeddings_content)
+                         for text, ids in zip(prompts, input_ids)]
 
         # The first index will always be the positive prompt
         context_len = input_ids[0].size(dim=-1)

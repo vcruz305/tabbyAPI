@@ -1,4 +1,4 @@
-from pydantic import AliasChoices, BaseModel, Field, field_validator
+from pydantic import AliasChoices, BaseModel, Field, PrivateAttr, StrictBool, field_validator
 from time import time
 from typing import Literal, Union, List, Optional, Dict
 from uuid import uuid4
@@ -79,6 +79,19 @@ class ReasoningOptions(BaseModel):
 class ChatCompletionRequest(CommonCompletionRequest):
     messages: List[ChatCompletionMessage]
     prompt_template: Optional[str] = None
+    literal_user_control_tokens: StrictBool = Field(
+        default=False,
+        description=(
+            "Opt in to ordinary BPE encoding of supported chat/reasoning/tool control "
+            "markers in user string content. Changes input token IDs and token counts, "
+            "while preserving rendered text, template controls and other message roles. "
+            "Requires provable user spans and a supported ExLlamaV3 BPE tokenizer; "
+            "multimodal content, continued messages and ambiguous/transformed templates "
+            "are rejected when applicable. Default false. Does not change output parsing "
+            "or guarantee literal copying."
+        ),
+    )
+    _literal_user_token_plan: object = PrivateAttr(default=None)
     add_generation_prompt: Optional[bool] = True
     template_vars: Optional[dict] = Field(
         default={},

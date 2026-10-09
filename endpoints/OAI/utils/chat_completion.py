@@ -17,6 +17,12 @@ from common.logger import xlogger
 import re
 
 from common import model
+from common.literal_user_tokens import (
+    LiteralUserTokenError,
+    locate_literal_user_spans,
+    recognized_markers,
+    targeted_user_indices,
+)
 from common.multimodal import MultimodalEmbeddingWrapper
 from common.networking import (
     get_context_length_generator_error,
@@ -522,6 +528,7 @@ async def apply_chat_template(data: ChatCompletionRequest):
     Template stop strings can be overriden by sampler overrides if force is true.
     """
 
+    data._literal_user_token_plan = None
     tool_format = getattr(model.container, "tool_format", None)
     nullable_guidance = nullable_guidance_eligible(data, tool_format)
     forced_choice = prepare_forced_tool_choice(
@@ -545,6 +552,18 @@ async def apply_chat_template(data: ChatCompletionRequest):
         functions = with_nullable_xml_guidance(functions)
 
     try:
+        literal_markers = ()
+        if data.literal_user_control_tokens:
+            if any(isinstance(message.content, list) for message in data.messages):
+                raise LiteralUserTokenError("Literal user control tokens require string-only chat content")
+            if not callable(getattr(model.container, "prepare_literal_user_token_plan", None)):
+                raise LiteralUserTokenError("Literal user control tokens require a supporting backend")
+            supported_markers = recognized_markers(getattr(model.container, "tokenizer", None))
+            messages = [message.model_dump(exclude_none=True) for message in data.messages]
+            if targeted_user_indices(messages, supported_markers):
+                if data.continue_final_message:
+                    raise LiteralUserTokenError("Literal user control tokens do not support continued messages")
+                literal_markers = supported_markers
         data.template_vars = resolve_template_vars(data, model.container)
         data.template_vars.update(
             {
@@ -570,6 +589,12 @@ async def apply_chat_template(data: ChatCompletionRequest):
             data.messages, data.template_vars
         )
 
+        literal_spans = ()
+        if literal_markers:
+            literal_spans = await locate_literal_user_spans(
+                model.container.prompt_template, template_vars, prompt, literal_markers
+            )
+
         if continued_message_text is not None:
             prompt = _cut_prompt_at_continue_tag(prompt, continued_message_text)
 
@@ -592,9 +617,22 @@ async def apply_chat_template(data: ChatCompletionRequest):
         bos_token = template_vars.get("bos_token")
         if bos_token and model.container.hf_model.add_bos_token() and prompt.startswith(bos_token):
             prompt = prompt.removeprefix(bos_token)
+            if literal_spans:
+                if any(left < len(bos_token) for left, _ in literal_spans):
+                    raise LiteralUserTokenError("BOS removal overlaps protected user text")
+                literal_spans = tuple((left - len(bos_token), right - len(bos_token))
+                                      for left, right in literal_spans)
 
+        if literal_spans:
+            if mm_embeddings and mm_embeddings.content:
+                raise LiteralUserTokenError("Literal user control tokens do not support multimodal embeddings")
+            data._literal_user_token_plan = model.container.prepare_literal_user_token_plan(
+                prompt, literal_spans
+            )
         return prompt, mm_embeddings
 
+    except LiteralUserTokenError as exc:
+        raise HTTPException(400, f"literal_user_control_tokens: {exc}") from exc
     except KeyError as exc:
         error_message = handle_request_error(
             "Could not find a Conversation from prompt template "
