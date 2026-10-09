@@ -32,6 +32,7 @@ from backends.exllamav3.reasoning import (
     NativeReasoningBudget,
     ReasoningBoundaryGuard,
     encode_forced_output,
+    implicit_reasoning_eos_ids,
     prepare_native_reasoning_budget,
     producer_phase_end_callback,
     supports_native_reasoning_budget,
@@ -1393,6 +1394,7 @@ class ExllamaV3Container:
         reasoning_phase: Optional[bool] = None,
         label: Optional[str] = None,
         reasoning_budget: Optional[NativeReasoningBudget] = None,
+        mandatory_tool_call: bool = False,
     ) -> AsyncIterator[Dict[str, Any]]:
         """
         Generates a response iteratively (streaming) for a given prompt.
@@ -1412,6 +1414,9 @@ class ExllamaV3Container:
             label: Short name for the request in console logs.
             reasoning_budget: Prepared initial reasoning handoff; a None limit
                 observes its natural end without forcing a cutoff.
+            mandatory_tool_call: Internal collector policy. For a supported
+                initial reasoning handoff, delay implicit EOS until the
+                required/named tool-call grammar can take over.
 
         Yields:
             Generation chunks
@@ -1442,6 +1447,7 @@ class ExllamaV3Container:
                 reasoning_phase=reasoning_phase,
                 label=label,
                 reasoning_budget=reasoning_budget,
+                mandatory_tool_call=mandatory_tool_call,
             ):
                 yield generation_chunk
         finally:
@@ -1745,6 +1751,7 @@ class ExllamaV3Container:
         reasoning_phase: Optional[bool] = None,
         label: Optional[str] = None,
         reasoning_budget: Optional[NativeReasoningBudget] = None,
+        mandatory_tool_call: bool = False,
     ):
         """
         Create generator function for prompt completion.
@@ -1785,7 +1792,9 @@ class ExllamaV3Container:
         # ) and gen_settings.token_repetition_range == -1
 
         prompts = [prompt]
-        stop_conditions = params.stop
+        # Keep caller/template stops separate from the implicit model EOS.
+        # Mutating params.stop also misclassifies EOS on a later choice/reuse.
+        stop_conditions = list(params.stop or [])
         add_bos_token = unwrap(params.add_bos_token, self.hf_model.add_bos_token())
         grammar_handler = ExLlamaV3Grammar()
 
@@ -1800,6 +1809,30 @@ class ExllamaV3Container:
         # Include stop conditions deduced by backend tokenizer
         stop_conditions += self.config.eos_token_id_list
         stop_conditions = list(set(stop_conditions))
+
+        # Mandatory tool choices deliberately treat examples inside reasoning
+        # as reasoning text. Implicit model EOS must not bypass that policy
+        # before the content grammar is attached. A verified producer handoff
+        # restores the ordinary sampler before the next content token; older
+        # engines and untracked formats retain their existing behavior.
+        if (mandatory_tool_call and reasoning_phase and reasoning_budget is not None
+                and reasoning_budget.parser is not None
+                and reasoning_budget.parser.tool_calls_in_reasoning is False):
+            blocked_eos = implicit_reasoning_eos_ids(
+                self.tokenizer, [*eos_tokens, *self.config.eos_token_id_list],
+                params.stop or [], reasoning_budget.end_token_id,
+            )
+            if blocked_eos:
+                base_reasoning_params = reasoning_params or params
+                protected_reasoning_params = base_reasoning_params.model_copy(update={
+                    "banned_tokens": list(dict.fromkeys(
+                        [*(base_reasoning_params.banned_tokens or []), *blocked_eos]
+                    )),
+                })
+                reasoning_sampler = ExllamaV3SamplerBuilder.from_params(
+                    protected_reasoning_params, self.tokenizer, self.max_seq_len
+                ).build(protected_reasoning_params.temperature == 0)
+
 
         input_ids = [
             self.tokenizer.encode(

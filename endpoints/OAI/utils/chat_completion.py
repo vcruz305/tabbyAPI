@@ -857,6 +857,11 @@ async def _chat_stream_collector(
         backend_options = {"reasoning_phase": phase_applied, "label": label}
         if native_budget is not None:
             backend_options["reasoning_budget"] = native_budget
+            if forced_choice is not None:
+                # Required/named calls are executable only after reasoning.
+                # Let the native phase handoff protect the implicit EOS gap
+                # while preserving auto's tool-calls-in-reasoning policy.
+                backend_options["mandatory_tool_call"] = True
         new_generation = mc.stream_generate(
             request_id,
             prompt,
