@@ -78,6 +78,40 @@ def prepare_native_reasoning_budget(
     return NativeReasoningBudget(max_tokens, ids, end_id, deepcopy(parser))
 
 
+
+def implicit_reasoning_eos_ids(tokenizer, eos_ids, explicit_stops, end_token_id):
+    """Implicit EOS that can be suppressed without shadowing a caller stop.
+
+    Stop conditions remain installed on the job. An explicit token ID or a
+    stop string overlapping the token's rendered piece takes priority, even
+    when the string could span adjacent pieces. Unknown pieces are left alone;
+    the phase-closing ID itself must remain available for the handoff.
+    """
+    explicit_ids = {value for value in explicit_stops
+                    if isinstance(value, int) and not isinstance(value, bool)}
+    explicit_text = [value for value in explicit_stops if isinstance(value, str) and value]
+    pieces = tokenizer.get_id_to_piece_list(True)
+
+    def overlaps(piece, stop):
+        if piece in stop or stop in piece:
+            return True
+        return any(piece.endswith(stop[:n]) or stop.endswith(piece[:n])
+                   for n in range(1, min(len(piece), len(stop))))
+
+    result = []
+    for token_id in dict.fromkeys(eos_ids):
+        if (not isinstance(token_id, int) or isinstance(token_id, bool)
+                or token_id == end_token_id or token_id in explicit_ids
+                or not 0 <= token_id < len(pieces)):
+            continue
+        piece = pieces[token_id]
+        if (not isinstance(piece, str) or not piece
+                or any(overlaps(piece, stop) for stop in explicit_text)):
+            continue
+        result.append(token_id)
+    return result
+
+
 def producer_phase_end_callback(container, request_id):
     """Switch settings in the producer before it samples any final content."""
     def on_end(native_job):
