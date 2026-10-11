@@ -28,6 +28,15 @@ from exllamav3.cache import CacheLayer_quant
 from backends.exllamav3.grammar import ExLlamaV3Grammar
 
 from backends.exllamav3.sampler import ExllamaV3SamplerBuilder
+from backends.exllamav3.reasoning import (
+    NativeReasoningBudget,
+    ReasoningBoundaryGuard,
+    encode_forced_output,
+    implicit_reasoning_eos_ids,
+    prepare_native_reasoning_budget,
+    producer_phase_end_callback,
+    supports_native_reasoning_budget,
+)
 from backends.exllamav3.utils import exllama_supports_nccl
 from backends.exllamav3.vision import clear_image_embedding_cache, image_embedding_cache
 from common.concurrency import iterate_in_threadpool
@@ -1371,6 +1380,8 @@ class ExllamaV3Container:
         mm_embeddings: Optional[MultimodalEmbeddingWrapper] = None,
         reasoning_phase: Optional[bool] = None,
         label: Optional[str] = None,
+        reasoning_budget: Optional[NativeReasoningBudget] = None,
+        mandatory_tool_call: bool = False,
     ) -> AsyncIterator[Dict[str, Any]]:
         """
         Generates a response iteratively (streaming) for a given prompt.
@@ -1388,6 +1399,11 @@ class ExllamaV3Container:
                 (default) for callers that don't: one set of settings and
                 filters from the first token.
             label: Short name for the request in console logs.
+            reasoning_budget: Prepared initial reasoning handoff; a None limit
+                observes its natural end without forcing a cutoff.
+            mandatory_tool_call: Internal collector policy. For a supported
+                initial reasoning handoff, delay implicit EOS until the
+                required/named tool-call grammar can take over.
 
         Yields:
             Generation chunks
@@ -1417,6 +1433,8 @@ class ExllamaV3Container:
                 mm_embeddings=mm_embeddings,
                 reasoning_phase=reasoning_phase,
                 label=label,
+                reasoning_budget=reasoning_budget,
+                mandatory_tool_call=mandatory_tool_call,
             ):
                 yield generation_chunk
         finally:
@@ -1429,11 +1447,12 @@ class ExllamaV3Container:
         reasoning block, swapping in that phase's sampler, banned strings and
         grammar filters. The swap applies from the next token the generator
         samples; tokens it sampled ahead of the caller keep the old settings.
-        With speculative decoding that can be several tokens, which a sampler
-        tolerates and a grammar does not: it would start mid-answer. So where
-        the end-of-reasoning tag is a single token, the filters for the first
-        content block are armed by the engine on that token instead, and only
-        the cases it can't cover are switched from here.
+        With speculative decoding that can be several tokens, which a grammar
+        cannot tolerate: it would start mid-answer. Supported initial reasoning
+        phases invoke this method synchronously through a guarded producer
+        callback, with or without a budget, before the next token is sampled.
+        Older engines use a raw end-token filter trigger where possible, with
+        consumer-timed switching for the remaining phase settings and formats.
 
         Returns False if the swap has to wait (a forced-output injection is
         still draining) and should be retried on the next chunk.
@@ -1477,6 +1496,17 @@ class ExllamaV3Container:
         phases.reasoning = reasoning
         return True
 
+    def prepare_reasoning_budget(self, max_tokens, text, initial_reasoning, parser=None):
+        return prepare_native_reasoning_budget(
+            self.tokenizer,
+            max_tokens,
+            text,
+            initial_reasoning=initial_reasoning and not self.harmony and not self.muse_glimmer,
+            end_token=self.reasoning_end_token,
+            supported=supports_native_reasoning_budget(AsyncJob, natural_only=max_tokens is None),
+            parser=parser,
+        )
+
     def constrain_generation_output(self, request_id: str, text: str) -> bool:
         """
         Force `text` into the output stream of an active generation job: the
@@ -1502,9 +1532,7 @@ class ExllamaV3Container:
         # Encode here rather than passing the string through: tokenizers with
         # a BOS post-processor (Llama-3 style) prepend BOS regardless of
         # add_bos, which would corrupt the injection
-        ids = self.tokenizer.encode(text, encode_special_tokens=True, add_bos=False)
-        if ids.shape[-1] > 0 and ids[0, 0].item() == self.tokenizer.bos_token_id:
-            ids = ids[:, 1:]
+        ids = encode_forced_output(self.tokenizer, text)
         if ids.shape[-1] == 0:
             return False
 
@@ -1709,6 +1737,8 @@ class ExllamaV3Container:
         mm_embeddings: Optional[MultimodalEmbeddingWrapper] = None,
         reasoning_phase: Optional[bool] = None,
         label: Optional[str] = None,
+        reasoning_budget: Optional[NativeReasoningBudget] = None,
+        mandatory_tool_call: bool = False,
     ):
         """
         Create generator function for prompt completion.
@@ -1749,7 +1779,9 @@ class ExllamaV3Container:
         # ) and gen_settings.token_repetition_range == -1
 
         prompts = [prompt]
-        stop_conditions = params.stop
+        # Keep caller/template stops separate from the implicit model EOS.
+        # Mutating params.stop also misclassifies EOS on a later choice/reuse.
+        stop_conditions = list(params.stop or [])
         add_bos_token = unwrap(params.add_bos_token, self.hf_model.add_bos_token())
         grammar_handler = ExLlamaV3Grammar()
 
@@ -1764,6 +1796,30 @@ class ExllamaV3Container:
         # Include stop conditions deduced by backend tokenizer
         stop_conditions += self.config.eos_token_id_list
         stop_conditions = list(set(stop_conditions))
+
+        # Mandatory tool choices deliberately treat examples inside reasoning
+        # as reasoning text. Implicit model EOS must not bypass that policy
+        # before the content grammar is attached. A verified producer handoff
+        # restores the ordinary sampler before the next content token; older
+        # engines and untracked formats retain their existing behavior.
+        if (mandatory_tool_call and reasoning_phase and reasoning_budget is not None
+                and reasoning_budget.parser is not None
+                and reasoning_budget.parser.tool_calls_in_reasoning is False):
+            blocked_eos = implicit_reasoning_eos_ids(
+                self.tokenizer, [*eos_tokens, *self.config.eos_token_id_list],
+                params.stop or [], reasoning_budget.end_token_id,
+            )
+            if blocked_eos:
+                base_reasoning_params = reasoning_params or params
+                protected_reasoning_params = base_reasoning_params.model_copy(update={
+                    "banned_tokens": list(dict.fromkeys(
+                        [*(base_reasoning_params.banned_tokens or []), *blocked_eos]
+                    )),
+                })
+                reasoning_sampler = ExllamaV3SamplerBuilder.from_params(
+                    protected_reasoning_params, self.tokenizer, self.max_seq_len
+                ).build(protected_reasoning_params.temperature == 0)
+
 
         input_ids = [
             self.tokenizer.encode(
@@ -1813,9 +1869,14 @@ class ExllamaV3Container:
         # swapped in by set_generation_phase. Otherwise from the first token
         trigger_token_id = None
         constrained = params.json_schema or params.regex_pattern or params.grammar_string
-        if constrained and reasoning_phase and getattr(self, "reasoning", False):
+        if (constrained and reasoning_phase and reasoning_budget is None
+                and getattr(self, "reasoning", False)):
             if self.reasoning_end_token:
                 trigger_token_id = self.tokenizer.single_id(self.reasoning_end_token)
+        # A producer handoff verifies the full parser state before ending the
+        # phase. A raw token trigger would activate even for a literal closing
+        # tag inside a tool argument, before that verification can protect it.
+        # Its content filters are attached only by the verified callback.
 
         if params.json_schema:
             # After a reasoning block the model expects to start on a new line
@@ -1933,6 +1994,30 @@ class ExllamaV3Container:
         if phases is not None:
             phases.job = job
             self.job_phases[request_id] = phases
+        # Configure before the first await: even a zero-token budget must be
+        # active before the async producer can sample. Producer callbacks also
+        # switch content settings before any speculative content is accepted.
+        # A natural-only watcher is unnecessary when both phases have identical
+        # settings. Keep such default jobs on the ordinary verification path.
+        if reasoning_budget is not None and (
+            reasoning_budget.max_tokens is not None or phases is not None
+        ):
+            try:
+                boundary_guard = (
+                    ReasoningBoundaryGuard(job.job, self.tokenizer, reasoning_budget.parser)
+                    if reasoning_budget.parser is not None else None
+                )
+                job.set_token_budget(
+                    reasoning_budget.max_tokens,
+                    reasoning_budget.output_ids,
+                    end_token_id=reasoning_budget.end_token_id,
+                    on_end=producer_phase_end_callback(self, request_id),
+                    can_end=boundary_guard,
+                )
+            except BaseException:
+                self.job_phases.pop(request_id, None)
+                await job.cancel()
+                raise
         await disconnect_handler.add_cleanup_task(id(job), job.cancel, ())
         job_status = status_display.add_job(request_id, label, context_len)
 

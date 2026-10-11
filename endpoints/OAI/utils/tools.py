@@ -3,6 +3,7 @@
 from dataclasses import dataclass, field
 from typing import Callable, List, Optional
 
+from common.errors import ToolCallParseError
 from common.logger import xlogger
 
 from endpoints.OAI.types.tools import ToolCall
@@ -232,7 +233,19 @@ def detect_reasoning_tags(
     return None, None
 
 
-def parse_toolcalls(tool_calls_str: str, tool_format: str) -> List[ToolCall]:
+def supports_delta_streaming(tool_format: str) -> bool:
+    """
+    True for formats with an incremental delta streamer (see toolcall_stream).
+    These formats can stream partial tool_calls argument deltas instead of
+    one complete delta at end of stream.
+    """
+
+    return _get_parser(tool_format) is qwen3_coder
+
+
+def parse_toolcalls(
+    tool_calls_str: str, tool_format: str, tools=None, strict: bool = False
+) -> List[ToolCall]:
     """
     Dispatch tool call parsing to the appropriate format handler.
 
@@ -241,7 +254,8 @@ def parse_toolcalls(tool_calls_str: str, tool_format: str) -> List[ToolCall]:
         tool_format: See below
 
     Returns:
-        List of parsed ToolCall objects. Empty list on parse failure (never raises).
+        List of parsed ToolCall objects. Empty list on ordinary parse failure.
+        Strict Qwen completeness failures raise ToolCallParseError.
     """
 
     try:
@@ -249,8 +263,12 @@ def parse_toolcalls(tool_calls_str: str, tool_format: str) -> List[ToolCall]:
         if not parser:
             return []
 
+        if parser is qwen3_coder:
+            return parser.parse_toolcalls(tool_calls_str, tools=tools, strict=strict)
         return parser.parse_toolcalls(tool_calls_str)
 
+    except ToolCallParseError:
+        raise
     except Exception as e:
         xlogger.error(
             "ToolCallProcessor.parse: Failed to parse tool calls",

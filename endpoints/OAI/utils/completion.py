@@ -35,7 +35,12 @@ from endpoints.OAI.types.completion import (
     chat_logprobs_to_completion_logprobs,
 )
 from endpoints.OAI.types.common import Timings, UsageStats
-from endpoints.OAI.utils.common_ import aggregate_usage_stats, get_timings, get_usage_stats
+from endpoints.OAI.utils.common_ import (
+    aggregate_usage_stats,
+    get_timings,
+    get_usage_stats,
+    response_model_name,
+)
 
 
 def _gen_label(request: Request, endpoint: str, n: int, task_idx: int, stream: bool) -> str:
@@ -136,7 +141,7 @@ def _compose_serialize_stream_chunk(
     }
 
     if model_name:
-        data["model_name"] = model_name
+        data["model"] = model_name
 
     # Prefill progress (llama.cpp's return_progress extension), top-level
     # beside the choices, on an otherwise empty chunk
@@ -183,7 +188,7 @@ def _compose_serialize_stream_usage_chunk(
     }
 
     if model_name:
-        data["model_name"] = model_name
+        data["model"] = model_name
 
     if timings is not None:
         data["timings"] = timings.model_dump(mode="json")
@@ -291,6 +296,7 @@ async def stream_generate_completion(
     gen_queue = asyncio.Queue()
     gen_tasks: List[asyncio.Task] = []
     return_usage = data.stream_options and data.stream_options.include_usage
+    response_model = response_model_name(getattr(data, "model", None), model_path)
 
     try:
         xlogger.debug(
@@ -350,7 +356,7 @@ async def stream_generate_completion(
             chunk, _, finish_reason, is_empty = _compose_serialize_stream_chunk(
                 request.state.id,
                 generation,
-                model_path.name,
+                response_model,
                 suppress_finish,
                 None if suppress_finish else timings,
             )
@@ -368,7 +374,7 @@ async def stream_generate_completion(
                             aggregate_usage_stats(usage_stats_list),
                             generation["index"],
                             finish_reason,
-                            model_path.name,
+                            response_model,
                             timings,
                         )
                         yield usage_chunk
@@ -411,6 +417,7 @@ async def generate_completion(
 
     gen_tasks: List[asyncio.Task] = []
     return_usage = True  # non-streaming responses always carry usage
+    response_model = response_model_name(getattr(data, "model", None), model_path)
 
     if isinstance(prompts, str):
         prompts = [prompts]
@@ -458,7 +465,7 @@ async def generate_completion(
             if isinstance(r, Exception):
                 raise r
             generations.append(r)
-        response = _compose_response(request.state.id, generations, model_path.name, return_usage)
+        response = _compose_response(request.state.id, generations, response_model, return_usage)
 
         xlogger.debug(f"{request_tag(request)} completion finished", {"response": response})
         return response

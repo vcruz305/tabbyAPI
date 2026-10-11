@@ -12,8 +12,9 @@ from typing import List, Optional, Union
 import aiofiles
 from fastapi import Header, HTTPException, Request
 from loguru import logger
-from pydantic import BaseModel, PrivateAttr
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, ValidationError
 from ruamel.yaml import YAML
+from ruamel.yaml.error import YAMLError
 
 from common.logger import xlogger
 from common.utils import coalesce
@@ -36,8 +37,12 @@ class AuthKeys(BaseModel):
     be granted (and revoked) per user. There is always exactly one admin_key.
     """
 
-    api_key: Union[str, List[str]]
-    admin_key: str
+    model_config = ConfigDict(hide_input_in_errors=True)
+
+    # Keep credential values out of direct and nested model representations.
+    # model_dump() still includes them when persisting the authentication file.
+    api_key: Union[str, List[str]] = Field(repr=False)
+    admin_key: str = Field(repr=False)
 
     _api_key_set: set = PrivateAttr(default_factory=set)
 
@@ -68,15 +73,24 @@ _reload_lock = asyncio.Lock()
 _watch_task: Optional[asyncio.Task] = None
 
 
+class AuthFileError(ValueError):
+    """An authentication file is invalid; its contents must not enter logs."""
+
+
 async def _read_auth_file(path: str = AUTH_FILE) -> AuthKeys:
     """Read and validate the auth keys file."""
 
     yaml = YAML(typ=["rt", "safe"])
 
-    async with aiofiles.open(path, "r", encoding="utf8") as auth_file:
-        contents = await auth_file.read()
+    try:
+        async with aiofiles.open(path, "r", encoding="utf8") as auth_file:
+            contents = await auth_file.read()
         auth_keys_dict = yaml.load(contents)
         return AuthKeys.model_validate(auth_keys_dict)
+    except (YAMLError, ValidationError, UnicodeError) as exc:
+        # YAML errors can include source lines, and validation errors can include
+        # nested input objects. Preserve the error category without their values.
+        raise AuthFileError(f"Invalid authentication file {path} ({type(exc).__name__})") from None
 
 
 async def _watch_auth_file():
@@ -111,18 +125,15 @@ async def _watch_auth_file():
             try:
                 AUTH_KEYS = await _read_auth_file()
             except Exception as exc:
-                xlogger.warning(f"Failed to reload {AUTH_FILE}, keeping the previous keys: {exc}")
+                xlogger.warning(
+                    f"Failed to reload {AUTH_FILE}, keeping the previous keys "
+                    f"({type(exc).__name__})."
+                )
                 continue
 
         xlogger.info(
             f"Reloaded auth keys from {AUTH_FILE} ({len(AUTH_KEYS._api_key_set)} API key(s))."
         )
-
-
-def _format_api_keys(auth_keys: AuthKeys) -> str:
-    if isinstance(auth_keys.api_key, str):
-        return auth_keys.api_key
-    return ", ".join(auth_keys.api_key)
 
 
 async def load_auth_keys(disable_from_config: bool):
@@ -175,10 +186,8 @@ async def load_auth_keys(disable_from_config: bool):
         _watch_task = asyncio.create_task(_watch_auth_file())
 
     logger.info(
-        f"Your API key is: {_format_api_keys(AUTH_KEYS)}\n"
-        f"Your admin key is: {AUTH_KEYS.admin_key}\n"
-        "If these keys get compromised, make sure to delete api_tokens.yml "
-        "and restart the server. Have fun!"
+        f"Authentication enabled: {AUTH_FILE} "
+        f"({len(AUTH_KEYS._api_key_set)} API key(s), 1 admin key)."
     )
 
 
