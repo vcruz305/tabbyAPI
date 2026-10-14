@@ -37,7 +37,9 @@ dependencies = [
     "requests",
 
     # Improved asyncio loops
-    "uvloop ; platform_system == 'Linux' and platform_machine == 'x86_64'",
+    # main.py imports uvloop on every non-Windows platform, so it must not be limited to
+    # x86_64: aarch64 (DGX Spark / GB10, Grace) and macOS otherwise fail at startup
+    "uvloop ; platform_system != 'Windows'",
     "winloop ; platform_system == 'Windows'",
 
     # For python 3.12
