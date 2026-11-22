@@ -25,6 +25,8 @@ from backends.exllamav3.reasoning import (
     producer_phase_end_callback,
     supports_native_reasoning_budget,
 )
+from common.gen_logging import log_metrics
+from common.metrics import MetricsManager
 from endpoints.OAI.utils import chat_completion as cc
 from endpoints.OAI.utils.stream_parser import Qwen3CoderStreamParser, TagStreamParser
 from tests.test_qwen_tool_contract import xml
@@ -100,6 +102,8 @@ def backend_symbols():
         "ReasoningBoundaryGuard": ReasoningBoundaryGuard,
         "xlogger": SimpleNamespace(debug=lambda *a, **k: None, warning=lambda *a, **k: None),
         "CancelledError": asyncio.CancelledError,
+        "MetricsManager": MetricsManager,
+        "log_metrics": log_metrics,
     }
     exec(compile(ast.Module(body=body, type_ignores=[]), str(path), "exec",
                  flags=__future__.annotations.compiler_flag), namespace)
@@ -448,6 +452,7 @@ class BackendArmingTests(unittest.IsolatedAsyncioTestCase):
         class Grammar:
             def __init__(self):
                 self.filters = []
+                self.gate = None  # ExLlamaV3Grammar's default: no message gate
             def add_grammar_filter(self, *args, **kwargs):
                 self.filters.append(SimpleNamespace(trigger_token=kwargs.get("trigger_token_id")))
 
@@ -478,7 +483,8 @@ class BackendArmingTests(unittest.IsolatedAsyncioTestCase):
         other = object()
         mc = SimpleNamespace(
             active_job_ids={"other": other}, job_phases={}, tokenizer=Tokenizer(),
-            generator=SimpleNamespace(generator=SimpleNamespace(recurrent_cache=None)),
+            bos_token_id=None,
+            generator=SimpleNamespace(generator=SimpleNamespace(recurrent_cache=None, max_draft_tokens=0)),
             max_seq_len=4096, cache=SimpleNamespace(max_num_tokens=4096),
             hf_model=SimpleNamespace(add_bos_token=lambda: False, eos_tokens=lambda: [99]),
             config=SimpleNamespace(eos_token_id_list=[]),
@@ -487,12 +493,18 @@ class BackendArmingTests(unittest.IsolatedAsyncioTestCase):
             loaded=True, load_condition=asyncio.Condition(), load_lock=asyncio.Lock(),
             handle_finish_chunk=lambda *a: {"finish_reason": "stop"},
         )
+        # The prompt is encoded through the container's encode_prompt (upstream);
+        # this fake container has no encode cache, so it delegates to the tokenizer.
+        mc.encode_prompt = lambda text, add_bos, encode_special_tokens=True, embeddings=None: (
+            mc.tokenizer.encode(text, add_bos=add_bos, encode_special_tokens=encode_special_tokens)
+        )
         for name in ("stream_generate", "generate_gen", "set_generation_phase"):
             setattr(mc, name, MethodType(ns[name], mc))
         params = SimpleNamespace(
             temperature=0, stop=[], add_bos_token=False, max_tokens=10, min_tokens=0,
             banned_strings=[], token_healing=False, logprobs=False, top_logprobs=0,
             json_schema=None, regex_pattern=None, grammar_string='start: "answer"',
+            loop_detect=False, loop_detect_error=False,
             model_dump=lambda **k: {}, reasoning_params=lambda: None,
             param_source=lambda key: "default", get_stop_on_loop=lambda: None,
         )

@@ -54,6 +54,12 @@ class ModelCard(BaseModel):
     logging: Optional[LoggingConfig] = None
     parameters: Optional[ModelCardParameters] = None
     meta: Optional[ModelCardMeta] = None
+    # The loaded context length under the name vLLM and SGLang give it, which is the
+    # one OpenAI-compatible clients that size their context window from /v1/models
+    # (OpenCode's discovery, for one) already read. Only the loaded model has it
+    max_model_len: Optional[int] = Field(
+        None, description="Loaded context length (max_seq_len) of the loaded model"
+    )
 
 
 class ModelList(BaseModel):
@@ -102,7 +108,17 @@ class DraftModelLoadRequest(_WarnOnUnknownFields):
     draft_cache_mode: Optional[str] = None
     draft_num_tokens: Optional[int] = None
     dynamic_draft: Optional[bool] = None
+    draft_confidence: Optional[float] = Field(
+        description="Target acceptance probability for dynamic drafting, in (0, 1)",
+        default=None,
+        examples=[0.4],
+        gt=0,
+        lt=1,
+    )
     ngram_match_min: Optional[int] = None
+    hybrid_draft_tokens: Optional[int] = None
+    draft_max_rows: Optional[int] = None
+    sparse_draft_head: Optional[int] = None
     draft_rope_scale: Optional[float] = None
     draft_rope_alpha: Optional[Union[float, Literal["auto"]]] = Field(
         description='Automatically calculated if set to "auto"',
@@ -146,6 +162,7 @@ class ModelLoadRequest(_WarnOnUnknownFields):
         examples=[4096],
     )
     cache_mode: Optional[str] = None
+    recurrent_state_fp32: Optional[bool] = None
     tensor_parallel: Optional[bool] = None
     tensor_parallel_backend: Optional[str] = "native"
     gpu_split_auto: Optional[bool] = None
@@ -185,6 +202,7 @@ class ModelLoadRequest(_WarnOnUnknownFields):
     vision: Optional[bool] = None
     vision_offload: Optional[bool] = None
     sampling: Optional[dict] = None
+    use_generation_config: Optional[bool] = None
     warmup: Optional[bool] = None
 
     # Memory and offload
@@ -193,6 +211,8 @@ class ModelLoadRequest(_WarnOnUnknownFields):
     cpu_moe_offload_layers: Optional[int] = None
     cpu_moe_split_experts: Optional[int] = None
     cpu_moe_threads: Optional[int] = None
+    cpu_moe_pinned_arena: Optional[bool] = None
+    layer_map: Optional[Union[List[int], str]] = None
 
     # Template variables
     template_vars_default: Optional[dict] = None
@@ -217,6 +237,95 @@ class ModelLoadRequest(_WarnOnUnknownFields):
     # Non-config arguments
     draft_model: Optional[DraftModelLoadRequest] = None
     skip_queue: Optional[bool] = False
+    inherit_defaults: Optional[bool] = Field(
+        default=True,
+        description=(
+            "Fill in options the request leaves out from the model folder's "
+            "tabby_config.yml and config.yml's use_as_default keys. With false, "
+            "the request is the complete set of options and anything it leaves "
+            "out gets the backend default"
+        ),
+    )
+
+
+class ModelLoadConfigResponse(BaseModel):
+    """The load options that apply to a model when a load request leaves them out."""
+
+    # Avoids pydantic namespace warning
+    model_config = ConfigDict(protected_namespaces=[])
+
+    model_name: str
+    has_tabby_config: bool = Field(description="Whether the model folder has a tabby_config.yml")
+    settings: dict = Field(
+        description=(
+            "Load request fields from the model's tabby_config.yml and the use_as_default "
+            "keys of config.yml, with draft options under draft_model"
+        )
+    )
+    sources: dict = Field(
+        description='Where each setting comes from: "tabby_config.yml" or "use_as_default"'
+    )
+    ignored: List[str] = Field(
+        default_factory=list,
+        description="Keys in tabby_config.yml that a load request can't set; they still apply",
+    )
+    yaml: str = Field(description="The settings as YAML, annotated with their sources")
+
+
+class LoadOptionsParseRequest(BaseModel):
+    """Load options written as YAML (or JSON), to turn into a load request body."""
+
+    yaml: str = Field(max_length=65536)
+
+
+class LoadOptionsParseResponse(BaseModel):
+    settings: dict
+
+
+class ModelLoadConfigSaveRequest(BaseModel):
+    """Load options to save as a model's tabby_config.yml, as YAML or as a mapping."""
+
+    # Avoids pydantic namespace warning
+    model_config = ConfigDict(protected_namespaces=[])
+
+    model_name: str
+    yaml: Optional[str] = Field(
+        default=None,
+        max_length=65536,
+        description="The options as YAML (or JSON), in the shape of a load request",
+    )
+    settings: Optional[dict] = Field(
+        default=None, description="The options as a mapping, in the shape of a load request"
+    )
+
+    @model_validator(mode="after")
+    def _one_source(self):
+        if (self.yaml is None) == (self.settings is None):
+            raise ValueError("Give the options as either yaml or settings")
+        return self
+
+
+class ModelLoadConfigSaveResponse(BaseModel):
+    """What was written to a model's tabby_config.yml."""
+
+    # Avoids pydantic namespace warning
+    model_config = ConfigDict(protected_namespaces=[])
+
+    model_name: str
+    saved: dict = Field(
+        description=(
+            "The load options now in the file, with draft options under draft_model. "
+            "Options that only repeat a use_as_default value are left out, unless the "
+            "file already had them"
+        )
+    )
+    backup: Optional[str] = Field(
+        default=None, description="The file the previous tabby_config.yml was copied to"
+    )
+    removed: bool = Field(
+        default=False,
+        description="Whether the file was removed, since nothing was left to save in it",
+    )
 
 
 class EmbeddingModelLoadRequest(BaseModel):

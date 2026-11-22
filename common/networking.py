@@ -5,6 +5,7 @@ import itertools
 import json
 import platform
 import socket
+import sys
 import traceback
 from fastapi import Depends, HTTPException, Request
 from loguru import logger
@@ -13,7 +14,7 @@ from pydantic import BaseModel
 from typing import Optional
 from uuid import uuid4
 
-from common.errors import context_length_error_content
+from common.errors import context_length_error_content, loop_detected_error_content
 from common.tabby_config import config
 
 
@@ -39,10 +40,12 @@ class TabbyRequestError(BaseModel):
     error: TabbyRequestErrorMessage
 
 
-def get_generator_error(message: str, exc_info: bool = True):
+def get_generator_error(
+    message: str, exc_info: bool = True, exception: Optional[BaseException] = None
+):
     """Get a generator error."""
 
-    generator_error = handle_request_error(message, exc_info)
+    generator_error = handle_request_error(message, exc_info, exception)
 
     return generator_error.model_dump_json()
 
@@ -54,10 +57,24 @@ def get_context_length_generator_error(message: str):
     return json.dumps(context_length_error_content(message))
 
 
-def handle_request_error(message: str, exc_info: bool = True):
-    """Log a request error to the console."""
+def get_loop_detected_generator_error(message: str):
+    """Get the loop detection error for an active stream."""
 
-    trace = traceback.format_exc()
+    handle_request_error(message, exc_info=False)
+    return json.dumps(loop_detected_error_content(message))
+
+
+def handle_request_error(
+    message: str, exc_info: bool = True, exception: Optional[BaseException] = None
+):
+    """
+    Log a request error to the console. The traceback is the exception being
+    handled, or exception when it was caught elsewhere (e.g. in another task).
+    """
+
+    if exception is None:
+        exception = sys.exc_info()[1]
+    trace = "".join(traceback.format_exception(exception)) if exception else ""
     send_trace = config.network.send_tracebacks
 
     error_message = TabbyRequestErrorMessage(message=message, trace=trace if send_trace else None)

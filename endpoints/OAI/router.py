@@ -10,6 +10,7 @@ from common.debug_requests import (
     log_chat_completion_request,
     write_chat_completion_prompt_log,
 )
+from common.errors import ContextLengthExceededError, ContextLengthHTTPException
 from common.model import check_embeddings_container, check_model_container
 from common.networking import (
     get_sse_ping_interval,
@@ -20,12 +21,23 @@ from common.networking import (
 )
 from common.tabby_config import config
 from common.logger import xlogger
-from endpoints.OAI.types.completion import CompletionRequest, CompletionResponse
+from endpoints.OAI.types.completion import (
+    CompletionRequest,
+    CompletionResponse,
+    ContinuationsRequest,
+    ContinuationsResponse,
+)
 from endpoints.OAI.types.chat_completion import (
     ChatCompletionRequest,
     ChatCompletionResponse,
 )
 from endpoints.OAI.types.embedding import EmbeddingsRequest, EmbeddingsResponse
+from endpoints.OAI.types.decisions import (
+    DecisionRequest,
+    DecisionResponse,
+    SystemOneRequest,
+    SystemOneResponse,
+)
 from endpoints.OAI.utils.common_ import load_inline_model
 from endpoints.OAI.utils.chat_completion import (
     apply_chat_template,
@@ -34,9 +46,15 @@ from endpoints.OAI.utils.chat_completion import (
 )
 from endpoints.OAI.utils.completion import (
     generate_completion,
+    generate_continuations,
     stream_generate_completion,
 )
 from endpoints.OAI.utils.embeddings import get_embeddings
+from endpoints.OAI.utils.decisions import (
+    DecisionValidationError,
+    generate_decisions,
+    generate_systemone,
+)
 
 
 api_name = "OAI"
@@ -44,6 +62,8 @@ router = APIRouter()
 urls = {
     "Completions": "http://{host}:{port}/v1/completions",
     "Chat completions": "http://{host}:{port}/v1/chat/completions",
+    "Decisions": "http://{host}:{port}/v1/decisions",
+    "System One": "http://{host}:{port}/v1/systemone",
 }
 
 # Block when model is still loading while second inline load request comes in
@@ -89,9 +109,9 @@ async def completion_request(request: Request, data: CompletionRequest) -> Compl
     try:
         disconnect_handler = DisconnectHandler(request, f"{request_tag(request)} completions")
         await disconnect_handler.poll()
+        model.check_context_length(prompt, data)
 
         if data.stream and not config.developer.disable_request_streaming:
-            model.check_context_length(prompt, data)
             return EventSourceResponse(
                 stream_generate_completion(prompt, data, request, model_path, disconnect_handler),
                 ping=get_sse_ping_interval(),
@@ -104,6 +124,31 @@ async def completion_request(request: Request, data: CompletionRequest) -> Compl
 
     except (CancelledError, InvalidStateError) as ex:
         raise HTTPException(422, "/v1/completions request cancelled by user.") from ex
+
+
+# Continuations endpoint
+@router.post(
+    "/v1/continuations",
+    dependencies=[Depends(check_api_key)],
+)
+async def continuations_request(
+    request: Request, data: ContinuationsRequest
+) -> ContinuationsResponse:
+    """
+    Lists the ways a prompt can go on under the given sampler settings: the likeliest
+    next tokens that pass truncation, each followed up to its next branch point.
+    """
+
+    await check_model_container()
+    model.check_context_length(data.prompt, data)
+
+    try:
+        disconnect_handler = DisconnectHandler(request, f"{request_tag(request)} continuations")
+        await disconnect_handler.poll()
+        return await generate_continuations(data, request, disconnect_handler)
+
+    except (CancelledError, InvalidStateError) as ex:
+        raise HTTPException(422, "/v1/continuations request cancelled by user.") from ex
 
 
 # Chat completions endpoint
@@ -167,6 +212,72 @@ async def chat_completion_request(
 
     except (CancelledError, InvalidStateError) as ex:
         raise HTTPException(422, "/v1/chat/completions request cancelled by user.") from ex
+
+
+# Decision endpoints: typed questions answered from the model's next-token
+# distribution at the answer position (see endpoints/OAI/utils/decisions.py)
+async def _answer_decisions(request: Request, model_name, route: str, generate):
+    async with load_lock:
+        if model_name:
+            await load_inline_model(model_name, request)
+        await check_model_container()
+
+    if model.container.prompt_template is None:
+        error_message = handle_request_error(
+            "Decisions are disabled because a prompt template is not set.",
+            exc_info=False,
+        ).error.message
+        raise HTTPException(422, error_message)
+
+    disconnect_handler = DisconnectHandler(request, f"{request_tag(request)} decisions")
+    try:
+        await disconnect_handler.poll()
+        return await generate(request, disconnect_handler)
+
+    except (CancelledError, InvalidStateError) as ex:
+        raise HTTPException(422, f"{route} request cancelled by user.") from ex
+
+    except DecisionValidationError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+    except ContextLengthExceededError as exc:
+        error_message = handle_request_error(str(exc), exc_info=False).error.message
+        raise ContextLengthHTTPException(error_message) from exc
+
+    finally:
+        await disconnect_handler.cleanup()
+
+
+@router.post("/v1/decisions", dependencies=[Depends(check_api_key)])
+async def decisions_request(request: Request, data: DecisionRequest) -> DecisionResponse:
+    """
+    OpenAI Decisions API: answer predicate, choice and score questions about a
+    shared input with a probability for every option. No text is generated.
+    """
+
+    xlogger.debug("[ENDPOINT] /v1/decisions", {"raw": await request.json()})
+    return await _answer_decisions(
+        request,
+        data.model,
+        "/v1/decisions",
+        lambda req, dh: generate_decisions(data, req, dh),
+    )
+
+
+@router.post("/v1/systemone", dependencies=[Depends(check_api_key)])
+async def systemone_request(request: Request, data: SystemOneRequest) -> SystemOneResponse:
+    """
+    TypeSafe System One API: answer choice, score and noul questions about a
+    state, as llama.cpp and vLLM serve it.
+    """
+
+    xlogger.debug("[ENDPOINT] /v1/systemone", {"raw": await request.json()})
+    return await _answer_decisions(
+        request,
+        data.model,
+        "/v1/systemone",
+        lambda req, dh: generate_systemone(data, req, dh),
+    )
 
 
 # Apply template endpoint (llama-server compatible)

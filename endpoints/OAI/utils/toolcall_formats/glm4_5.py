@@ -7,6 +7,7 @@ from endpoints.OAI.utils.toolcall_formats.common import FormatSignature, coerce_
 
 """
 GLM-4.5 / GLM-4.6 / GLM-4.7 family - XML with interleaved key/value pairs
+Also used verbatim by inclusionAI's Ling 3.x models (BailingMoeV3).
 
 Raw format:
     <tool_call>__FUNCTION_NAME__
@@ -32,7 +33,7 @@ TOOLCALL_END = "</tool_call>"
 DETECT = FormatSignature(
     template_markers=("<tool_call>", "<arg_key>"),
     special_tokens=("<arg_key>", "<arg_value>"),
-    architectures=("Glm4", "Glm5", "GlmMoe", "Laguna", "Spark2_5"),
+    architectures=("Glm4", "Glm5", "GlmMoe", "Laguna", "Spark2_5", "BailingMoe"),
     reasoning_tags=("<think>", "</think>"),
 )
 
@@ -42,7 +43,7 @@ _ARG_KEY = re.compile(r"<arg_key>(.*?)</arg_key>", re.DOTALL)
 _ARG_VALUE = re.compile(r"<arg_value>(.*?)</arg_value>", re.DOTALL)
 
 
-def parse_toolcalls(text: str) -> list[ToolCall]:
+def parse_toolcalls(text: str, param_types=None) -> list[ToolCall]:
     outer_matches = list(_OUTER.finditer(text))
 
     results = []
@@ -61,9 +62,10 @@ def parse_toolcalls(text: str) -> list[ToolCall]:
         keys = [m.group(1).strip() for m in _ARG_KEY.finditer(inner)]
         values = [m.group(1).strip() for m in _ARG_VALUE.finditer(inner)]
 
+        declared = (param_types or {}).get(func_name, {})
         args: dict[str, any] = {}
         for key, val in zip_longest(keys, values):
-            args[key] = coerce_param_value(val)
+            args[key] = coerce_param_value(val, declared.get(key))
 
         args_json = json.dumps(args, ensure_ascii=False)
         results.append(ToolCall(function=Tool(name=func_name, arguments=args_json)))

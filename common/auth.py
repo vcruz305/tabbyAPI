@@ -136,6 +136,12 @@ async def _watch_auth_file():
         )
 
 
+def _format_api_keys(auth_keys: AuthKeys) -> str:
+    if isinstance(auth_keys.api_key, str):
+        return auth_keys.api_key
+    return ", ".join(auth_keys.api_key)
+
+
 async def load_auth_keys(disable_from_config: bool):
     """Load the authentication keys from api_tokens.yml. If the file does not
     exist, generate new keys and save them to api_tokens.yml."""
@@ -185,10 +191,26 @@ async def load_auth_keys(disable_from_config: bool):
     if _watch_task is None:
         _watch_task = asyncio.create_task(_watch_auth_file())
 
-    logger.info(
-        f"Authentication enabled: {AUTH_FILE} "
-        f"({len(AUTH_KEYS._api_key_set)} API key(s), 1 admin key)."
-    )
+    if log_auth_keys():
+        logger.info(
+            f"Your API key is: {_format_api_keys(AUTH_KEYS)}\n"
+            f"Your admin key is: {AUTH_KEYS.admin_key}\n"
+            "If these keys get compromised, make sure to delete api_tokens.yml "
+            "and restart the server. Have fun!"
+        )
+    else:
+        logger.info(
+            f"Authentication enabled: {AUTH_FILE} "
+            f"({len(AUTH_KEYS._api_key_set)} API key(s), 1 admin key)."
+        )
+
+
+def log_auth_keys() -> bool:
+    """Whether the keys themselves may appear in the console log and startup links."""
+
+    from common.tabby_config import config
+
+    return bool(config.logging.log_auth_keys)
 
 
 def get_key_permission(request: Request):

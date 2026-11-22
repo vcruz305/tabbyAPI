@@ -1,12 +1,15 @@
 """Tool call processing utilities for OAI server."""
 
+import inspect
 from dataclasses import dataclass, field
+from functools import lru_cache
 from typing import Callable, List, Optional
 
 from common.errors import ToolCallParseError
 from common.logger import xlogger
 
 from endpoints.OAI.types.tools import ToolCall
+from endpoints.OAI.utils.toolcall_formats.common import param_types_from_tools
 from endpoints.OAI.utils.toolcall_formats import (
     qwen3_coder,
     minimax_m2,
@@ -15,6 +18,7 @@ from endpoints.OAI.utils.toolcall_formats import (
     hy3,
     muse_glimmer,
     deepseek_v4,
+    deepseek_v41,
     mistral_old,
     mistral,
     gemma4,
@@ -27,6 +31,8 @@ from endpoints.OAI.utils.toolcall_formats import (
 ALL_TOOLCALL_FORMATS = {
     "deepseek_v4": deepseek_v4,
     "dsv4": deepseek_v4,
+    "deepseek_v41": deepseek_v41,
+    "dsv41": deepseek_v41,
     "gemma4": gemma4,
     "glm4_5": glm4_5,
     "glm4_6": glm4_5,
@@ -45,6 +51,8 @@ ALL_TOOLCALL_FORMATS = {
     "hy_v3": hy3,
     "laguna": glm4_5,
     "poolside_v1": glm4_5,
+    "ling": glm4_5,
+    "ling3": glm4_5,
     "lfm": lfm2,
     "lfm2": lfm2,
     "lfm2_5": lfm2,
@@ -240,11 +248,24 @@ def supports_delta_streaming(tool_format: str) -> bool:
     one complete delta at end of stream.
     """
 
-    return _get_parser(tool_format) is qwen3_coder
+    # Imported here: toolcall_stream imports this module
+    from endpoints.OAI.utils.toolcall_stream import DELTA_STREAMERS
+
+    return canonical_format_name(tool_format) in DELTA_STREAMERS
+
+
+@lru_cache(maxsize=None)
+def _accepts_param(parser, name: str) -> bool:
+    return name in inspect.signature(parser.parse_toolcalls).parameters
 
 
 def parse_toolcalls(
-    tool_calls_str: str, tool_format: str, tools=None, strict: bool = False
+    tool_calls_str: str,
+    tool_format: str,
+    param_types: Optional[dict] = None,
+    *,
+    tools=None,
+    strict: bool = False,
 ) -> List[ToolCall]:
     """
     Dispatch tool call parsing to the appropriate format handler.
@@ -252,6 +273,9 @@ def parse_toolcalls(
     Args:
         tool_calls_str: Raw tool call text from model generation.
         tool_format: See below
+        param_types: Declared parameter types from the request's tools
+            (common.param_types_from_tools), for formats whose values are
+            untyped text. Ignored by formats that don't take them.
 
     Returns:
         List of parsed ToolCall objects. Empty list on ordinary parse failure.
@@ -264,7 +288,13 @@ def parse_toolcalls(
             return []
 
         if parser is qwen3_coder:
-            return parser.parse_toolcalls(tool_calls_str, tools=tools, strict=strict)
+            return parser.parse_toolcalls(
+                tool_calls_str, tools=tools, strict=strict, param_types=param_types
+            )
+        if param_types is None and tools:
+            param_types = param_types_from_tools(tools)
+        if param_types is not None and _accepts_param(parser, "param_types"):
+            return parser.parse_toolcalls(tool_calls_str, param_types=param_types)
         return parser.parse_toolcalls(tool_calls_str)
 
     except ToolCallParseError:

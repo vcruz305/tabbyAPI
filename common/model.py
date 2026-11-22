@@ -2,14 +2,20 @@
 
 import aiofiles
 import asyncio
+import copy
 import pathlib
+import traceback
 from enum import Enum
 from fastapi import HTTPException
 from common.logger import xlogger
 from ruamel.yaml import YAML
 from typing import Optional
 
-from common.errors import ContextLengthExceededError, ContextLengthHTTPException
+from common.errors import (
+    ContextLengthExceededError,
+    ContextLengthHTTPException,
+    EmptyPromptError,
+)
 from common.logger import get_loading_progress_bar
 from common.multimodal import MultimodalEmbeddingWrapper
 from common.networking import handle_request_error
@@ -79,52 +85,93 @@ def validate_backend(backend: Optional[str], hf_model: HFModel):
         )
 
 
-async def apply_load_defaults(model_path: pathlib.Path, **kwargs):
+MODEL_CONFIG_FILE = "tabby_config.yml"
+
+
+async def read_model_config_file(model_path: pathlib.Path) -> Optional[dict]:
+    """
+    The load overrides in a model folder's tabby_config.yml, as
+    {"model": {...}, "draft_model": {...}}, or None if the folder has none.
+    """
+
+    config_path = model_path / MODEL_CONFIG_FILE
+    if not config_path.exists():
+        return None
+
+    async with aiofiles.open(config_path, "r", encoding="utf8") as config_file:
+        contents = await config_file.read()
+
+    file_config = unwrap(YAML(typ="safe").load(contents), {})
+    sections = {}
+    for section in ("model", "draft_model"):
+        sections[section] = unwrap(
+            file_config.get(section) if isinstance(file_config, dict) else None, {}
+        )
+        if not isinstance(file_config, dict) or not isinstance(sections[section], dict):
+            raise ValueError(
+                f"{config_path} must hold mappings of options under model: and draft_model:"
+            )
+
+    return sections
+
+
+def use_as_default_settings() -> dict:
+    """
+    The config.yml values that use_as_default carries over to every load, as
+    {model keys..., "draft_model": {...}}. A copy, since merging modifies it.
+    """
+
+    return copy.deepcopy({**config.model_defaults, "draft_model": config.draft_model_defaults})
+
+
+async def apply_load_defaults(
+    model_path: pathlib.Path,
+    request_wins: bool = False,
+    inherit_defaults: bool = True,
+    **kwargs,
+):
     """
     Applies model load overrides.
 
-    Priority, lowest to highest: use_as_default keys, the load kwargs
-    (startup config or API request), then the model folder's
-    tabby_config.yml, which always wins when present.
+    Priority, lowest to highest: use_as_default keys, then the load kwargs and
+    the model folder's tabby_config.yml. For a startup load the file wins,
+    since the kwargs hold every config.yml value, set or not. An API request
+    (request_wins) only carries the options the client set, and those win
+    over the file. A request that doesn't inherit_defaults is the complete set
+    of options, and gets neither.
     """
 
-    override_config_path = model_path / "tabby_config.yml"
+    if not inherit_defaults:
+        merged_kwargs = deep_merge_dicts({"draft_model": {}}, kwargs)
+        xlogger.info(
+            "The load request gives every option (inherit_defaults: false), so "
+            "tabby_config.yml and use_as_default don't apply"
+        )
+        xlogger.debug("Applying load defaults", {"kwargs": kwargs, "inherit_defaults": False})
+        return merged_kwargs
+
+    file_config = await read_model_config_file(model_path)
 
     # Inline overrides from the model folder's tabby_config.yml
     inline_overrides = {"draft_model": {}}
+    if file_config is not None:
+        if file_config["model"]:
+            inline_overrides.update(file_config["model"])
+        else:
+            xlogger.warning(
+                'Cannot find inline model overrides. Make sure they are nested under a "model:" key'
+            )
 
-    if override_config_path.exists():
-        async with aiofiles.open(
-            override_config_path, "r", encoding="utf8"
-        ) as override_config_file:
-            contents = await override_config_file.read()
+        if file_config["draft_model"]:
+            inline_overrides["draft_model"] = file_config["draft_model"]
 
-            # Create a temporary YAML parser
-            yaml = YAML(typ="safe")
-            inline_config = unwrap(yaml.load(contents), {})
+        xlogger.info(f"Applying model overrides from {model_path / MODEL_CONFIG_FILE}")
 
-            model_inline_config = unwrap(inline_config.get("model"), {})
-            if model_inline_config:
-                inline_overrides = {**inline_overrides, **model_inline_config}
-            else:
-                xlogger.warning(
-                    "Cannot find inline model overrides. "
-                    'Make sure they are nested under a "model:" key'
-                )
-
-            draft_inline_config = unwrap(inline_config.get("draft_model"), {})
-            if draft_inline_config:
-                inline_overrides["draft_model"] = draft_inline_config
-
-            xlogger.info(f"Applying model overrides from {override_config_path}")
-
-    # use_as_default keys
-    defaults = {
-        **config.model_defaults,
-        "draft_model": {**config.draft_model_defaults},
-    }
-
-    merged_kwargs = deep_merge_dicts(defaults, kwargs, inline_overrides)
+    defaults = use_as_default_settings()
+    if request_wins:
+        merged_kwargs = deep_merge_dicts(defaults, inline_overrides, kwargs)
+    else:
+        merged_kwargs = deep_merge_dicts(defaults, kwargs, inline_overrides)
 
     xlogger.debug(
         "Applying load defaults",
@@ -132,6 +179,7 @@ async def apply_load_defaults(model_path: pathlib.Path, **kwargs):
             "kwargs": kwargs,
             "defaults": defaults,
             "inline_overrides": inline_overrides,
+            "request_wins": request_wins,
             "merged_kwargs": merged_kwargs,
         },
     )
@@ -147,8 +195,31 @@ async def unload_model(skip_wait: bool = False, shutdown: bool = False):
     sampling.clear_model_overrides()
 
 
-async def load_model_gen(model_path: pathlib.Path, **kwargs):
-    """Generator to load a model"""
+async def unload_failed_container(failed_container, exc: Exception):
+    """
+    Release what a load got through before it failed. The container never
+    becomes the global one, so nothing else would unload it: modules already
+    in VRAM, and CPU MoE worker processes with their (possibly pinned) expert
+    arenas, would stay allocated for the life of the server.
+    """
+
+    # The failed frames still reference the tensors being loaded. Clearing
+    # their locals keeps the traceback printable but lets the memory go
+    traceback.clear_frames(exc.__traceback__)
+
+    xlogger.info("Model load failed, releasing the partially loaded model.")
+    try:
+        await failed_container.unload(skip_wait=True)
+    except Exception as unload_exc:
+        xlogger.warning(f"Could not release the partially loaded model: {unload_exc}")
+
+
+async def load_model_gen(model_path: pathlib.Path, request_wins: bool = False, **kwargs):
+    """
+    Generator to load a model. request_wins lets the kwargs override the model
+    folder's tabby_config.yml; set it when they hold only options a client
+    chose (see apply_load_defaults).
+    """
     global container
 
     async with load_lock:
@@ -181,7 +252,7 @@ async def load_model_gen(model_path: pathlib.Path, **kwargs):
         # Merge with config and inline defaults
         # TODO: Figure out a way to do this with Pydantic validation
         # and ModelLoadRequest. Pydantic doesn't have async validators
-        kwargs = await apply_load_defaults(model_path, **kwargs)
+        kwargs = await apply_load_defaults(model_path, request_wins=request_wins, **kwargs)
 
         # Fetch the extra HF configuration options
         hf_model = await HFModel.from_directory(model_path)
@@ -251,14 +322,50 @@ async def load_model_gen(model_path: pathlib.Path, **kwargs):
                             progress.stop()
 
                 container = new_container
+            except Exception as exc:
+                progress.stop()
+                await unload_failed_container(new_container, exc)
+                raise
             finally:
                 progress.stop()
 
         # Sampler overrides for this model, replacing the previous model's layer
-        if sampler_preset or sampler_inline:
-            await sampling.set_model_overrides(sampler_preset, sampler_inline)
+        model_defaults = generation_config_defaults(
+            hf_model, unwrap(kwargs.get("use_generation_config"), False)
+        )
+        if sampler_preset or sampler_inline or model_defaults:
+            await sampling.set_model_overrides(sampler_preset, sampler_inline, model_defaults)
         else:
             sampling.clear_model_overrides()
+
+
+def generation_config_defaults(hf_model: HFModel, enabled: bool) -> dict:
+    """
+    The sampling values of the model's generation_config.json when the
+    use_generation_config load option is on, checked the way a request's values
+    are so a bad entry is dropped at load rather than failing every request.
+    """
+
+    if not enabled:
+        return {}
+
+    values = hf_model.generation_config.sampler_defaults() if hf_model.generation_config else {}
+    if not values:
+        xlogger.info(
+            "generation_config.json sets no sampling parameters; the configured sampler "
+            "overrides apply unchanged."
+        )
+        return {}
+
+    for name, value in list(values.items()):
+        try:
+            BaseSamplerRequest.model_validate({name: value})
+        except ValueError as exc:
+            xlogger.warning(
+                f"Ignoring {name} {value!r} from generation_config.json: {exc.errors()[0]['msg']}"
+            )
+            del values[name]
+    return values
 
 
 async def load_model(model_path: pathlib.Path, **kwargs):
@@ -358,7 +465,7 @@ def check_context_length(
     params: BaseSamplerRequest,
     mm_embeddings: Optional[MultimodalEmbeddingWrapper] = None,
 ):
-    """Reject oversized prompts before a streaming response commits HTTP 200."""
+    """Reject unusable prompts before a streaming response commits HTTP 200."""
 
     if isinstance(prompts, str):
         prompts = [prompts]
@@ -369,3 +476,6 @@ def check_context_length(
     except ContextLengthExceededError as exc:
         error_message = handle_request_error(str(exc), exc_info=False).error.message
         raise ContextLengthHTTPException(error_message) from exc
+    except EmptyPromptError as exc:
+        error_message = handle_request_error(str(exc), exc_info=False).error.message
+        raise HTTPException(400, error_message) from exc

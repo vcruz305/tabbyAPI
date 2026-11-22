@@ -15,9 +15,9 @@ from common import gen_logging, sampling
 from common.args import convert_args_to_dict, init_argparser
 from common.auth import load_auth_keys
 from common.actions import run_subcommand
-from common.logger import set_console_timestamps, setup_logger, xlogger
+from common.logger import setup_logger, xlogger
 from common.networking import port_bind_error
-from common.optional_dependencies import dependencies
+from common.optional_dependencies import check_package_version, dependencies
 from common.signals import signal_handler
 from common.status_display import status_display
 from common.tabby_config import config
@@ -165,9 +165,8 @@ def entrypoint(
 
     dict_args = convert_args_to_dict(args, parser)
 
-    # load config
+    # load config (also applies logging.log_timestamps to the console)
     config.load(dict_args)
-    set_console_timestamps(config.logging.log_timestamps)
 
     # optionally enable seqlog logging
     if config.developer.seqlog:
@@ -192,14 +191,12 @@ def entrypoint(
             "allocator backend is CUDA-only."
         )
     elif config.memory.cuda_malloc_async:
+        import sys
+
         env_key1 = "PYTORCH_ALLOC_CONF"
         env_key2 = "PYTORCH_CUDA_ALLOC_CONF"
         new_alloc_config = "backend:cudaMallocAsync"
         prev_alloc_config = os.environ.get(env_key1, os.environ.get(env_key2))
-        os.environ[env_key1] = new_alloc_config
-        os.environ[env_key2] = new_alloc_config
-        import sys
-
         if "torch" in sys.modules and prev_alloc_config != new_alloc_config:
             xlogger.warning(
                 "`torch` was imported before config could be loaded. Unable to configure "
@@ -207,34 +204,42 @@ def entrypoint(
                 + (prev_alloc_config or "(Torch default)")
             )
         else:
+            os.environ[env_key1] = new_alloc_config
+            os.environ[env_key2] = new_alloc_config
             xlogger.info("Configured backend: cudaMallocAsync")
 
     # branch to default paths if required
     if run_subcommand(args):
         return
 
-    # Check inference dependencies and give a descriptive error if they are missing
-    # Skip if launching unsafely
+    # Check that the inference dependencies are installed and recent enough,
+    # giving a descriptive error if not. Skip both checks if launching unsafely
     if config.developer.unsafe_launch:
         logger.warning(
             "UNSAFE: Skipping ExllamaV3 version check.\n"
             "If you aren't a developer, please keep this off!"
         )
-    elif not dependencies.inference:
-        install_message = (
-            f"ERROR: Inference dependencies for TabbyAPI are not installed.\n"
-            "Please update your environment by running an update script "
-            "(update_scripts/"
-            f"update_deps.{'bat' if platform.system() == 'Windows' else 'sh'})\n\n"
-            "Or you can manually run a requirements update "
-            "using the following command:\n\n"
-            "For CUDA 12.x:\n"
-            "pip install --upgrade .[cu12]\n\n"
-            "For CUDA 13.x:\n"
-            "pip install --upgrade .[cu13]\n\n"
-        )
+    else:
+        if not dependencies.inference:
+            install_message = (
+                f"ERROR: Inference dependencies for TabbyAPI are not installed.\n"
+                "Please update your environment by running an update script "
+                "(update_scripts/"
+                f"update_deps.{'bat' if platform.system() == 'Windows' else 'sh'})\n\n"
+                "Or you can manually run a requirements update "
+                "using the following command:\n\n"
+                "For CUDA 12.x:\n"
+                "pip install --upgrade .[cu12]\n\n"
+                "For CUDA 13.x:\n"
+                "pip install --upgrade .[cu13]\n\n"
+            )
+            raise SystemExit(install_message)
 
-        raise SystemExit(install_message)
+        # Exit cleanly on an outdated engine instead of printing a traceback
+        try:
+            check_package_version("exllamav3", "1.6.6")
+        except RuntimeError as exc:
+            raise SystemExit(str(exc)) from None
 
     # Set the process priority
     if config.developer.realtime_process_priority:

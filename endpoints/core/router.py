@@ -1,9 +1,12 @@
 import asyncio
+import os
 import pathlib
 from typing import Optional
 from common.multimodal import MultimodalEmbeddingWrapper
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
+from ruamel.yaml import YAML
+from ruamel.yaml.error import YAMLError
 from sse_starlette import EventSourceResponse
 
 from common import model, sampling
@@ -19,15 +22,23 @@ from common.tabby_config import config
 from common.templating import PromptTemplate, get_all_templates
 from common.utils import unwrap
 from common.health import HealthManager
+from common.optional_dependencies import package_version_info
+from common.status_display import status_display
+from common.metrics import MetricsManager
 from endpoints.OAI.utils.chat_completion import format_messages_with_template
 from endpoints.core.types.auth import AuthPermissionResponse
 from endpoints.core.types.download import DownloadRequest, DownloadResponse
 from endpoints.core.types.lora import LoraList, LoraLoadRequest, LoraLoadResponse
 from endpoints.core.types.model import (
     EmbeddingModelLoadRequest,
+    LoadOptionsParseRequest,
+    LoadOptionsParseResponse,
     ModelCard,
     ModelDefaultGenerationSettings,
     ModelList,
+    ModelLoadConfigResponse,
+    ModelLoadConfigSaveRequest,
+    ModelLoadConfigSaveResponse,
     ModelLoadRequest,
     ModelLoadResponse,
     ModelPropsModalities,
@@ -37,6 +48,11 @@ from endpoints.core.types.health import HealthCheckResponse
 from endpoints.core.types.sampler_overrides import (
     SamplerOverrideListResponse,
     SamplerOverrideSwitchRequest,
+)
+from endpoints.core.types.status import (
+    LoadOptionsSchemaResponse,
+    StatusJobText,
+    StatusResponse,
 )
 from endpoints.core.types.template import TemplateList, TemplateSwitchRequest
 from endpoints.core.types.token import (
@@ -50,7 +66,10 @@ from endpoints.core.utils.model import (
     get_current_model,
     get_current_model_list,
     get_dummy_models,
+    get_load_option_schema,
     get_model_list,
+    get_model_load_config,
+    save_model_load_config,
     stream_model_load,
 )
 
@@ -68,6 +87,27 @@ async def healthcheck(response: Response) -> HealthCheckResponse:
         response.status_code = 503
 
     return HealthCheckResponse(status="healthy" if healthy else "unhealthy", issues=issues)
+
+
+# Prometheus-compatible metrics endpoint (opt-in via config)
+@router.get("/metrics", dependencies=[Depends(check_api_key)])
+async def metrics():
+    """Expose process-wide inference counters in the Prometheus text format."""
+
+    if not config.network.enable_metrics:
+        raise HTTPException(
+            404,
+            "The metrics endpoint is disabled. Set network.enable_metrics to true in config.yml "
+            "to enable it.",
+        )
+
+    model_name = model.container.model_dir.name if model.container else None
+
+    return Response(
+        content=MetricsManager.render_prometheus(status_display.snapshot(), model_name),
+        media_type="text/plain; version=0.0.4",
+        headers={"Process-Start-Time-Unix": str(int(MetricsManager.process_start_time))},
+    )
 
 
 @router.get("/.well-known/serviceinfo")
@@ -204,6 +244,188 @@ async def load_model(data: ModelLoadRequest) -> ModelLoadResponse:
         raise HTTPException(400, error_message)
 
     return EventSourceResponse(stream_model_load(data, model_path), ping=get_sse_ping_interval())
+
+
+@router.get("/v1/model/load_config", dependencies=[Depends(check_admin_key)])
+async def model_load_config(model_name: str) -> ModelLoadConfigResponse:
+    """
+    The load options that apply to a model when a load request leaves them
+    out: the model folder's tabby_config.yml over config.yml's use_as_default
+    keys. Also given as YAML, ready to edit and send back with a load request.
+    """
+
+    model_path = pathlib.Path(config.model.model_dir) / model_name
+    if not model_path.is_dir():
+        error_message = handle_request_error(
+            f"Model {model_name} was not found in the model directory.",
+            exc_info=False,
+        ).error.message
+
+        raise HTTPException(404, error_message)
+
+    try:
+        return await get_model_load_config(model_name, model_path)
+    except (YAMLError, ValueError) as exc:
+        error_message = handle_request_error(
+            f"Could not read the tabby_config.yml of {model_name}: {exc}",
+            exc_info=False,
+        ).error.message
+
+        raise HTTPException(400, error_message) from exc
+
+
+@router.get("/v1/model/load_options", dependencies=[Depends(check_admin_key)])
+async def load_options_schema() -> LoadOptionsSchemaResponse:
+    """
+    Every option a model load request can set, grouped, with its type, the
+    backend default, accepted values and a description, for building a form.
+    """
+
+    return get_load_option_schema()
+
+
+def parse_load_options_yaml(text: str) -> dict:
+    """Load options written as YAML (or JSON), as a mapping."""
+
+    try:
+        settings = YAML(typ="safe").load(text)
+    except YAMLError as exc:
+        error_message = handle_request_error(
+            f"Load options are not valid YAML: {exc}", exc_info=False
+        ).error.message
+
+        raise HTTPException(400, error_message) from exc
+
+    if settings is None:
+        settings = {}
+    if not isinstance(settings, dict):
+        error_message = handle_request_error(
+            "Load options must be a mapping of option names to values.", exc_info=False
+        ).error.message
+
+        raise HTTPException(400, error_message)
+
+    return settings
+
+
+@router.post("/v1/model/load_config/parse", dependencies=[Depends(check_admin_key)])
+async def parse_load_options(data: LoadOptionsParseRequest) -> LoadOptionsParseResponse:
+    """
+    Turn load options written as YAML (or JSON) into a load request body, so
+    clients can edit them as YAML without a YAML parser of their own.
+    """
+
+    return LoadOptionsParseResponse(settings=parse_load_options_yaml(data.yaml))
+
+
+@router.post("/v1/model/load_config/save", dependencies=[Depends(check_admin_key)])
+async def save_load_options(data: ModelLoadConfigSaveRequest) -> ModelLoadConfigSaveResponse:
+    """
+    Save load options as the model folder's tabby_config.yml, for loads that
+    leave them out. Options that only repeat a use_as_default value are left
+    out, unless the file already has them. An existing file is copied to
+    tabby_config.bak first, and keeps its comments and any keys a load request
+    can't set.
+    """
+
+    # Only model folders under the model directory, by name, not by where a
+    # symlinked folder points
+    model_root = pathlib.Path(os.path.normpath(config.model.model_dir))
+    model_path = pathlib.Path(os.path.normpath(model_root / data.model_name))
+    if (
+        model_path == model_root
+        or not model_path.is_relative_to(model_root)
+        or not (model_path / "config.json").is_file()
+    ):
+        error_message = handle_request_error(
+            f"Model {data.model_name} was not found in the model directory.",
+            exc_info=False,
+        ).error.message
+
+        raise HTTPException(404, error_message)
+
+    settings = data.settings if data.yaml is None else parse_load_options_yaml(data.yaml)
+    try:
+        return await save_model_load_config(data.model_name, model_path, settings)
+    except (YAMLError, ValueError) as exc:
+        error_message = handle_request_error(
+            f"Could not save the load options of {data.model_name}: {exc}",
+            exc_info=False,
+        ).error.message
+
+        raise HTTPException(400, error_message) from exc
+    except OSError as exc:
+        error_message = handle_request_error(
+            f"Could not write the tabby_config.yml of {data.model_name}: {exc}",
+            exc_info=False,
+        ).error.message
+
+        raise HTTPException(500, error_message) from exc
+
+
+@router.get("/v1/status", dependencies=[Depends(check_api_key)])
+async def server_status(request: Request) -> StatusResponse:
+    """
+    Live status for monitoring: the generation jobs in progress and the ones
+    that finished recently, the engine's cache statistics, and token counters
+    since startup (a client takes rates from the change between polls).
+
+    Any API key can read it. Reading a job's text and cancelling a job need
+    the admin key, so for other keys no job is marked as cancellable.
+    """
+
+    snapshot = status_display.snapshot()
+    container = model.container
+    snapshot["model"] = (
+        str(container.model_dir) if container and getattr(container, "loaded", False) else None
+    )
+    info = package_version_info("exllamav3")
+    snapshot["backend"] = {"name": "exllamav3", **info} if info else None
+    if get_key_permission(request) != "admin":
+        for job in snapshot["jobs"]:
+            job["can_cancel"] = False
+
+    return StatusResponse(**snapshot)
+
+
+@router.get("/v1/status/jobs/{request_id}", dependencies=[Depends(check_admin_key)])
+async def status_job_text(request_id: str, offset: int = 0, prompt: bool = False) -> StatusJobText:
+    """
+    The text a job in progress, or one that finished recently, has generated
+    from the given offset on, and its prompt when asked for. Polling with the
+    last text_length as the offset gets only the new text.
+    """
+
+    job = status_display.find_job(request_id)
+    if job is None:
+        raise HTTPException(404, f"No job {request_id} is running or finished recently.")
+
+    offset = min(max(offset, 0), job.text_length)
+    return StatusJobText(
+        request_id=request_id,
+        offset=offset,
+        text=job.text(offset),
+        text_length=job.text_length,
+        finished=job.finished is not None,
+        finish_reason=job.finish_reason,
+        prompt=job.prompt if prompt else None,
+    )
+
+
+@router.post("/v1/status/jobs/{request_id}/cancel", dependencies=[Depends(check_admin_key)])
+async def cancel_status_job(request_id: str):
+    """
+    Cancel a job in progress. Its client gets what was generated so far, with
+    finish_reason "abort".
+    """
+
+    job = status_display.jobs.get(request_id)
+    if job is None or job.cancel is None:
+        raise HTTPException(404, f"No job {request_id} is running.")
+
+    if not job.cancel_requested:
+        await job.cancel()
+    return {"request_id": request_id, "cancelled": True}
 
 
 # Unload model endpoint

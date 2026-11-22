@@ -50,6 +50,17 @@ network:
   # Generation requests are already logged in detail; this adds the rest, such as model list and health polls.
   access_log: false
 
+  # Serve a Prometheus-compatible /metrics endpoint (default: False).
+  # Metric names follow llama.cpp's under a tabbyapi: prefix, and the token counters move
+  # during a generation. Requires an API key unless disable_auth is set.
+  enable_metrics: false
+
+  # Serve the built-in chat client at /ui and the status page at
+  # /ui/status (default: True). Static pages for testing models and
+  # settings, loading models and watching the server; they only use
+  # the regular API, so they do nothing until a browser opens them.
+  web_ui: true
+
 # Options for logging
 logging:
   # Enable prompt logging (default: False).
@@ -69,6 +80,12 @@ logging:
   # Prefix console log lines with the time of day (default: True).
   # The log files under logs/ always carry full timestamps.
   log_timestamps: true
+
+  # Print the API and admin keys to the console at startup (default: False).
+  # Off, the startup log only states how many keys api_tokens.yml holds, for consoles or
+  # log files that others can read. Set to true to print the keys; the web UI links
+  # printed at startup then include the admin key.
+  log_auth_keys: false
 
   # Write every /v1/chat/completions request to logs/debug/ as JSON (default: False).
   # Also saves the fully templated prompt (the exact text sent to the tokenizer)
@@ -127,6 +144,10 @@ model:
   # The legacy values 'FP16', 'Q8', 'Q6', 'Q4' are also accepted.
   cache_mode: FP16
 
+  # Store GatedDeltaNet/KDA recurrent state in FP32 instead of FP16 (default: False).
+  # Uses twice the state and checkpoint memory; scans compute in FP32 either way.
+  recurrent_state_fp32: false
+
   # Load model with tensor parallelism.
   # Falls back to autosplit if GPU split isn't provided.
   # This ignores the gpu_split_auto value.
@@ -170,6 +191,20 @@ model:
   # Applies to both cpu_moe_offload_layers and cpu_moe_split_experts. When unset,
   # defers to the EXL3_MOE_CPU_THREADS environment variable, then half the CPU core count.
   cpu_moe_threads:
+
+  # Keep the CPU MoE worker's expert weights in shared, page-locked memory (default: None).
+  # Streamed prefill then copies experts straight from it to the GPU, and cpu_moe_split_experts
+  # can promote frequently used experts into spare VRAM slots on the fly. Costs about 0.2 s per
+  # GiB of offloaded experts at load. Only has an effect with cpu_moe_offload_layers or
+  # cpu_moe_split_experts. When unset, defers to the EXL3_MOE_PINNED_ARENA environment variable.
+  cpu_moe_pinned_arena:
+
+  # RYS layer map for the exllamav3 backend (default: unset).
+  # Either a list of layer indices or a string spec of comma-separated ints and
+  # inclusive ranges, e.g. "0..6,4..6". Forward passes traverse the model in this
+  # order; repeated layers get individual cache tensors. Weights still load in the
+  # original layer order.
+  layer_map:
 
   # Load a model's n-gram embedding table fully into system RAM (default: False).
   # Only affects PLE models with n-gram embeddings (e.g. Qwen3.8-Flash-Next). By default
@@ -255,6 +290,13 @@ model:
   #     override: 0.5
   #     force: false
   sampling:
+
+  # Take fallback sampling values from the model's generation_config.json (default: False).
+  # The temperature, top_k, top_p, min_p and repetition_penalty it sets apply to requests that
+  # omit them, ahead of the global sampling section; parameters the file doesn't set keep those
+  # fallbacks. do_sample: false means greedy decoding. The model's own sampling section still
+  # wins over the file.
+  use_generation_config: false
 
   # Warm up the model after loading (default: False).
   # Runs a short schedule of forward passes so kernel compilation, autotuning and CUDA graph
@@ -373,21 +415,45 @@ draft_model:
 
   # Array of VRAM sizes to split between GPUs, in GB (default: []).
   # If this isn't filled in, the draft model is autosplit.
+  # Ignored for draft models that load alongside their target model
+  # (e.g. Gemma4 assistant drafters), which follow the target's split.
   draft_gpu_split: []
 
   # Number of tokens to draft per iteration (default: draft model default)
-  # Recurrent (linear or sliding attention) models use more VRAM for longer drafts.
-  # This overhead multiplies with the max batch size, so for models with long drafts
-  # (e.g. DFlash with 15 tokens by default) shorter drafts may be preferable.
   draft_num_tokens:
 
   # Adjust number of draft tokens dynamically based on observed acceptance rates (default: False)
   # Ceiling is given by num_draft_tokens.
   dynamic_draft:
 
+  # Target acceptance probability for drafted positions when dynamic_draft is enabled
+  # (default: 0.4). Evaluated against an online mapping from drafter confidence scores
+  # to observed acceptance rates. Lower values keep longer drafts; higher values
+  # truncate more aggressively. Must be between 0 and 1. Ignored for n-gram drafting.
+  draft_confidence: 0.4
+
   # Minimum match length for exllamav3 n-gram drafting (default: 2).
   # Only used when draft_mode is ngram.
   ngram_match_min: 2
+
+  # Hybrid drafting: when the model is repeating a passage of its context verbatim (reciting
+  # a drafted reply, editing source), draft this many tokens of the earlier continuation in
+  # one verification pass (default: 0, off). Works on top of any draft mode, or on its own.
+  # Longer values advance more tokens at prefill speed on a hit, and cost a wider
+  # verification pass.
+  hybrid_draft_tokens: 0
+
+  # Ceiling on the decoding rows of a speculative round, batch size times (1 + draft tokens)
+  # (default: 0, no ceiling). The draft window shrinks as the batch grows so that verifying
+  # drafts doesn't cost more than drafting saves at high concurrency.
+  draft_max_rows: 0
+
+  # Draft through a dynamic sparse LM head of this many vocabulary columns (default: 0, full
+  # head). Cuts draft latency for MTP and DFlash drafters, which share the target's head;
+  # verification keeps the full head so output is unaffected. The column set follows the token
+  # frequencies seen in prompts and generations, saved per tokenizer under the user cache
+  # directory. Layer-split loads only; ignored with tensor parallelism.
+  sparse_draft_head: 0
 
 # Options for Sampling
 sampling:
@@ -453,6 +519,29 @@ memory:
 
   # Size of system memory second-tier K/V cache, in MB (default: 0)
   sysmem_kv_cache: 0
+
+  # Directory for a persistent third-tier cache on disk (default: None).
+  # K/V pages entering the system memory tier and recurrent checkpoints are written through
+  # to disk and read back when a prompt's pages are in no other tier, also in a later server
+  # process. Requires sysmem_kv_cache > 0 and ExLlamaV3 1.6.2 or later (ignored with a warning
+  # otherwise). Each model and cache configuration gets its own subdirectory, so one directory
+  # serves every model. Experimental.
+  disk_cache_dir:
+
+  # Size budget of the whole disk cache directory, in MB (default: 51200).
+  # Shared by every model and cache configuration stored under disk_cache_dir; the least
+  # recently used entries are removed to stay within it.
+  disk_cache_size: 51200
+
+  # Also write every complete page still in VRAM to the disk cache whenever the generator
+  # goes idle, so a context is persisted without having to be evicted first (default: True).
+  disk_cache_flush_on_idle: true
+
+  # Minimum spacing, in tokens, between the recurrent checkpoints the disk cache keeps along
+  # a chain of cached pages (default: 4096). A resumed prompt replays at most this many
+  # tokens. Checkpoints take far more space than pages on hybrid models. 0 keeps every
+  # checkpoint.
+  disk_cache_checkpoint_interval: 4096
 
   # Size of the image embedding cache in system memory, in MB (default: 1024).
   # Encoded images are kept so repeated turns of a conversation don't re-run the vision model.

@@ -95,6 +95,15 @@ class NetworkConfig(BaseConfigModel):
         ),
         ge=0,
     )
+    enable_metrics: Optional[bool] = Field(
+        False,
+        description=(
+            "Enable the Prometheus-compatible /metrics endpoint (default: False).\n"
+            "Exposes aggregate inference stats in the text exposition format,\n"
+            "with the same names as llama.cpp's under a tabbyapi: prefix.\n"
+            "Requires an API key unless disable_auth is set."
+        ),
+    )
     access_log: Optional[bool] = Field(
         False,
         description=(
@@ -102,6 +111,15 @@ class NetworkConfig(BaseConfigModel):
             "(default: False).\n"
             "Generation requests are already logged in detail; this adds the rest, "
             "such as model list and health polls."
+        ),
+    )
+    web_ui: Optional[bool] = Field(
+        True,
+        description=(
+            "Serve the built-in chat client at /ui and the status page at\n"
+            "/ui/status (default: True). Static pages for testing models and\n"
+            "settings, loading models and watching the server; they only use\n"
+            "the regular API, so they do nothing until a browser opens them."
         ),
     )
 
@@ -144,6 +162,15 @@ class LoggingConfig(BaseConfigModel):
         description=(
             "Prefix console log lines with the time of day (default: True).\n"
             "The log files under logs/ always carry full timestamps."
+        ),
+    )
+    log_auth_keys: Optional[bool] = Field(
+        False,
+        description=(
+            "Print the API and admin keys to the console at startup (default: False).\n"
+            "Off, the startup log only states how many keys api_tokens.yml holds, for consoles\n"
+            "or log files that others can read. Set to True to print the keys; the web UI\n"
+            "links printed at startup then include the admin key."
         ),
     )
     log_chat_completion_requests: Optional[bool] = Field(
@@ -249,6 +276,13 @@ class ModelConfig(BaseConfigModel):
             f"The legacy values {str(CACHE_SIZES)[15:-1]} are also accepted."
         ),
     )
+    recurrent_state_fp32: Optional[bool] = Field(
+        False,
+        description=(
+            "Store GatedDeltaNet/KDA recurrent state in FP32 instead of FP16. "
+            "Uses twice the state and checkpoint memory; scans compute in FP32 either way."
+        ),
+    )
     tensor_parallel: Optional[bool] = Field(
         False,
         description=(
@@ -318,6 +352,27 @@ class ModelConfig(BaseConfigModel):
             "Applies to both cpu_moe_offload_layers and cpu_moe_split_experts.\n"
             "When unset, defers to the EXL3_MOE_CPU_THREADS environment\n"
             "variable, then half the CPU core count."
+        ),
+    )
+    cpu_moe_pinned_arena: Optional[bool] = Field(
+        None,
+        description=(
+            "keep the CPU MoE worker's expert weights in shared, page-locked\n"
+            "memory (default: None). Streamed prefill then copies experts\n"
+            "straight from it to the GPU, and cpu_moe_split_experts can\n"
+            "promote frequently used experts into spare VRAM slots on the fly.\n"
+            "Costs about 0.2 s per GiB of offloaded experts at load. Only has an\n"
+            "effect with cpu_moe_offload_layers or cpu_moe_split_experts. When\n"
+            "unset, defers to the EXL3_MOE_PINNED_ARENA environment variable."
+        ),
+    )
+    layer_map: Optional[Union[List[int], str]] = Field(
+        None,
+        description=(
+            "RYS layer map for the exllamav3 backend (default: None).\n"
+            "Either a list of layer indices or a string spec of comma-separated\n"
+            "ints and inclusive ranges, e.g. '0..6,4..6'. Forward passes traverse\n"
+            "the model in this order; repeated layers get individual cache tensors."
         ),
     )
     ngram_ram: Optional[bool] = Field(
@@ -463,6 +518,17 @@ class ModelConfig(BaseConfigModel):
             "model folder's tabby_config.yml so each model can carry its own\n"
             "sampling defaults; request parameters still take precedence unless\n"
             "an override is forced."
+        ),
+    )
+    use_generation_config: Optional[bool] = Field(
+        False,
+        description=(
+            "Take fallback sampling values from the model's generation_config.json "
+            "(default: False).\n"
+            "The temperature, top_k, top_p, min_p and repetition_penalty it sets apply to\n"
+            "requests that omit them, ahead of the global sampling section; parameters\n"
+            "the file doesn't set keep those fallbacks. do_sample: false means greedy\n"
+            "decoding. This model's own sampling section still wins over the file."
         ),
     )
     template_vars_default: dict = Field(
@@ -635,17 +701,14 @@ class DraftModelConfig(BaseConfigModel):
         default_factory=list,
         description=(
             "Array of VRAM sizes to split between GPUs, in GB (default: []).\n"
-            "If this isn't filled in, the draft model is autosplit."
+            "If this isn't filled in, the draft model is autosplit.\n"
+            "Ignored for draft models that load alongside their target model\n"
+            "(e.g. Gemma4 assistant drafters), which follow the target's split."
         ),
     )
     draft_num_tokens: Optional[int] = Field(
         None,
-        description=(
-            "Number of tokens to draft per iteration (default: draft model default)\n"
-            "Recurrent (linear or sliding attention) models use more VRAM for longer drafts.\n"
-            "This overhead multiplies with the max batch size, so for models with long drafts\n"
-            "(e.g. DFlash with 15 tokens by default) shorter drafts may be preferable."
-        ),
+        description=("Number of tokens to draft per iteration (default: draft model default)"),
     )
     dynamic_draft: Optional[bool] = Field(
         False,
@@ -654,12 +717,58 @@ class DraftModelConfig(BaseConfigModel):
             "Ceiling is given by num_draft_tokens."
         ),
     )
+    draft_confidence: Optional[float] = Field(
+        0.4,
+        description=(
+            "Target acceptance probability for drafted positions when dynamic_draft is "
+            "enabled (default: 0.4).\n"
+            "Evaluated against an online mapping from drafter confidence scores to "
+            "observed acceptance rates.\n"
+            "Lower values keep longer drafts; higher values truncate more aggressively.\n"
+            "Must be between 0 and 1. Ignored for n-gram drafting."
+        ),
+        gt=0,
+        lt=1,
+    )
     ngram_match_min: Optional[int] = Field(
         2,
         description=(
             "Minimum match length for exllamav3 n-gram drafting (default: 2).\n"
             "Only used when draft_mode is ngram."
         ),
+    )
+    hybrid_draft_tokens: Optional[int] = Field(
+        0,
+        description=(
+            "Hybrid drafting: when the model is repeating a passage of its context\n"
+            "verbatim (reciting a drafted reply, editing source), draft this many\n"
+            "tokens of the earlier continuation in one verification pass (default: 0,\n"
+            "off). Works on top of any draft mode, or on its own. Longer values advance\n"
+            "more tokens at prefill speed on a hit, and cost a wider verification pass."
+        ),
+        ge=0,
+    )
+    draft_max_rows: Optional[int] = Field(
+        0,
+        description=(
+            "Ceiling on the decoding rows of a speculative round, batch size times\n"
+            "(1 + draft tokens) (default: 0, no ceiling). The draft window shrinks as\n"
+            "the batch grows so that verifying drafts doesn't cost more than drafting\n"
+            "saves at high concurrency."
+        ),
+        ge=0,
+    )
+    sparse_draft_head: Optional[int] = Field(
+        0,
+        description=(
+            "Draft through a dynamic sparse LM head of this many vocabulary columns\n"
+            "(default: 0, full head). Cuts draft latency for MTP and DFlash drafters,\n"
+            "which share the target's head; verification keeps the full head so output\n"
+            "is unaffected. The column set follows the token frequencies seen in\n"
+            "prompts and generations, saved per tokenizer under the user cache\n"
+            "directory. Layer-split loads only; ignored with tensor parallelism."
+        ),
+        ge=0,
     )
 
 
@@ -685,7 +794,7 @@ class SamplingConfig(BaseConfigModel):
             "This overrides default fallbacks for sampler values "
             "that are passed to the API.\n"
             "NOTE: safe_defaults provides llama.cpp-style fallbacks (temperature 0.8, "
-            "top_k 40, top_p 0.95, min_p 0.05)\n"
+            "top_k 40, top_p 0.95, min_p 0.05, temperature applied last)\n"
             "for frontends that don't send sampling parameters. Leaving this blank "
             "means no fallbacks at all.\n"
             "Individual overrides can also be written directly in this section\n"
@@ -763,6 +872,45 @@ class MemoryConfig(BaseConfigModel):
     sysmem_kv_cache: Optional[int] = Field(
         0,
         description=("Size of system memory second-tier K/V cache, in MB (default: 0)"),
+    )
+    disk_cache_dir: Optional[str] = Field(
+        None,
+        description=(
+            "Directory for a persistent third-tier cache on disk (default: None).\n"
+            "K/V pages entering the system memory tier and recurrent checkpoints are\n"
+            "written through to disk and read back when a prompt's pages are in no\n"
+            "other tier, also in a later server process. Requires sysmem_kv_cache > 0\n"
+            "and ExLlamaV3 1.6.2 or later (ignored with a warning otherwise). Each\n"
+            "model and cache configuration gets its own subdirectory, so one directory\n"
+            "serves every model. Experimental."
+        ),
+    )
+    disk_cache_size: Optional[int] = Field(
+        51200,
+        description=(
+            "Size budget of the whole disk cache directory, in MB (default: 51200).\n"
+            "Shared by every model and cache configuration stored under disk_cache_dir;\n"
+            "the least recently used entries are removed to stay within it."
+        ),
+        gt=0,
+    )
+    disk_cache_flush_on_idle: Optional[bool] = Field(
+        True,
+        description=(
+            "Also write every complete page still in VRAM to the disk cache whenever\n"
+            "the generator goes idle, so a context is persisted without having to be\n"
+            "evicted first (default: True)."
+        ),
+    )
+    disk_cache_checkpoint_interval: Optional[int] = Field(
+        4096,
+        description=(
+            "Minimum spacing, in tokens, between the recurrent checkpoints the disk\n"
+            "cache keeps along a chain of cached pages (default: 4096). A resumed prompt\n"
+            "replays at most this many tokens. Checkpoints take far more space than\n"
+            "pages on hybrid models. 0 keeps every checkpoint."
+        ),
+        ge=0,
     )
     sysmem_multimodal_cache: Optional[int] = Field(
         1024,

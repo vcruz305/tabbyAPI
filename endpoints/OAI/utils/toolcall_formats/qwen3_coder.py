@@ -97,7 +97,7 @@ def coerce_value(raw: str):
 class ToolSchemas:
     """Request-local parameter type lookup, shared by full and delta parsers."""
 
-    def __init__(self, tools=None):
+    def __init__(self, tools=None, param_types=None):
         self.functions = {}
         self._types = {}
         for tool in tools or []:
@@ -106,6 +106,13 @@ class ToolSchemas:
             function = tool.get("function", tool)
             if isinstance(function, dict):
                 self.functions[function.get("name")] = function.get("parameters") or {}
+        # Single declared types as common.param_types_from_tools gives them
+        # ({function: {parameter: "string" | None}}). None names no single type,
+        # so the full schema above decides for that parameter.
+        for function, declared in (param_types or {}).items():
+            for key, kind in (declared or {}).items():
+                if isinstance(kind, str):
+                    self._types[(function, key)] = {kind}
 
     def types(self, function: str, parameter: str) -> set[str]:
         key = (function, parameter)
@@ -147,7 +154,9 @@ class ToolSchemas:
         return value
 
 
-def parse_toolcalls(text: str, tools=None, strict: bool = False) -> list[ToolCall]:
+def parse_toolcalls(
+    text: str, tools=None, strict: bool = False, param_types=None
+) -> list[ToolCall]:
     """Parse complete function blocks without interpreting markup in values.
 
     Incomplete functions or parameters are never converted into empty calls.
@@ -156,7 +165,7 @@ def parse_toolcalls(text: str, tools=None, strict: bool = False) -> list[ToolCal
     wrappers raise rather than silently returning only a completed prefix.
     No generated text is evaluated or executed.
     """
-    schemas = tools if isinstance(tools, ToolSchemas) else ToolSchemas(tools)
+    schemas = tools if isinstance(tools, ToolSchemas) else ToolSchemas(tools, param_types)
     results = []
     position = 0
     while True:

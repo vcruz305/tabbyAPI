@@ -45,6 +45,7 @@ from uuid import uuid4
 
 from common.logger import xlogger
 from endpoints.OAI.utils.toolcall_formats import qwen3_coder
+from endpoints.OAI.utils.tools import canonical_format_name
 
 _FUNC_OPEN = re.compile(r"<function=([^>\s]+)[^>]*>")
 _PARAM_OPEN = re.compile(r"<parameter=([^>\s]+)[^>]*>")
@@ -99,8 +100,11 @@ class QwenToolCallDeltaStreamer:
     _OUT = 0
     _VALUE = 1
 
-    def __init__(self, tools=None, max_calls=None, validate_name=None):
-        self.schemas = qwen3_coder.ToolSchemas(tools)
+    def __init__(self, param_types=None, *, tools=None, max_calls=None, validate_name=None):
+        # param_types: {function: {parameter: declared type}} as
+        # common.param_types_from_tools gives it. tools: the request's tool
+        # definitions, which also carry unions and $ref schemas. Either or both.
+        self.schemas = qwen3_coder.ToolSchemas(tools, param_types)
         self.max_calls = max_calls
         self.validate_name = validate_name
         self.completed = 0
@@ -119,6 +123,11 @@ class QwenToolCallDeltaStreamer:
 
         self._names: list[str] = []
         self._argument_fragments: list[list[str]] = []
+
+    @property
+    def names(self) -> list[str]:
+        """Function names of the calls streamed so far, in index order."""
+        return list(self._names)
 
     @property
     def _assembled(self) -> list[str]:
@@ -449,3 +458,25 @@ class QwenToolCallDeltaStreamer:
                 )
         except Exception as exc:  # never fail the stream on verification
             xlogger.debug(f"Tool-call delta verification skipped: {exc}")
+
+
+# Formats with an incremental streamer, by canonical format name
+DELTA_STREAMERS = {
+    "qwen3_coder": QwenToolCallDeltaStreamer,
+}
+
+
+def make_delta_streamer(
+    tool_format: Optional[str],
+    param_types: Optional[dict] = None,
+    *,
+    tools=None,
+    max_calls: Optional[int] = None,
+    validate_name=None,
+):
+    """The delta streamer for a format, or None when the format has none."""
+
+    cls = DELTA_STREAMERS.get(canonical_format_name(tool_format)) if tool_format else None
+    if cls is None:
+        return None
+    return cls(param_types, tools=tools, max_calls=max_calls, validate_name=validate_name)
