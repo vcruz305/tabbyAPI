@@ -46,6 +46,7 @@ from endpoints.OAI.utils.stream_parser import (
     ChannelStreamParser,
     GlimmerStreamParser,
     HarmonyStreamParser,
+    Inkling2StreamParser,
     TagStreamParser,
     Qwen3CoderStreamParser,
 )
@@ -158,9 +159,9 @@ def _resolve_start_in_reasoning(prompt: str, data: ChatCompletionRequest) -> boo
     """Determine whether generation starts inside a reasoning block."""
 
     mc = model.container
-    if mc.harmony or mc.muse_glimmer:
-        # Harmony and Glimmer message headers determine the channel; there
-        # is no ambiguity for the parser to resolve, except for a continued
+    if mc.harmony or mc.muse_glimmer or mc.inkling2:
+        # Harmony, Glimmer and Inkling 2 message headers determine the channel;
+        # there is no ambiguity for the parser to resolve, except for a continued
         # message, whose header is in the prompt
         return _continued_field(data) == "reasoning_content"
     if not mc.reasoning:
@@ -804,6 +805,8 @@ def _reasoning_budget_injection(mc, message: str) -> Optional[str]:
         suffix = "<|end|><|start|>assistant<|channel|>final<|message|>"
     elif mc.muse_glimmer:
         suffix = "<|eom|><|start|>assistant to=user<|message|>"
+    elif mc.inkling2:
+        suffix = "<|end_message|><|message_model|><|content_text|>"
     elif mc.reasoning and mc.reasoning_start_token and mc.reasoning_end_token:
         suffix = mc.reasoning_end_token
     else:
@@ -862,6 +865,12 @@ async def _chat_stream_collector(
         use_think = False
         use_tool = False
         parser = GlimmerStreamParser(initial_channel)
+    elif mc.inkling2:
+        # Inkling 2 uses typed content tokens in place of channels
+        tool_format = "inkling2"
+        use_think = False
+        use_tool = False
+        parser = Inkling2StreamParser(initial_channel)
     else:
         tool_format = mc.tool_format
         t_tool_start, t_tool_end = get_toolcall_tags(tool_format)

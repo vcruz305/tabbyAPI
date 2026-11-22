@@ -344,6 +344,7 @@ LOAD_OPTION_GROUPS = [
             "tool_format",
             "harmony",
             "muse_glimmer",
+            "inkling2",
         ],
     ),
     ("Sampling and warmup", "model", ["sampling", "use_generation_config", "warmup"]),

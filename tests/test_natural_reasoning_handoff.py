@@ -63,7 +63,7 @@ class NaturalPreparationTests(unittest.TestCase):
 
     def test_actual_backend_declines_none_on_9c_and_accepts_only_new_capability(self):
         ns = backend_symbols()
-        mc = SimpleNamespace(tokenizer=Tokenizer(), reasoning_end_token='</think>', harmony=False, muse_glimmer=False)
+        mc = SimpleNamespace(tokenizer=Tokenizer(), reasoning_end_token='</think>', harmony=False, muse_glimmer=False, inkling2=False)
         for capability in (False, True):
             ns['AsyncJob'] = SimpleNamespace(
                 set_token_budget=lambda n, out, *, end_token_id, on_end=None, can_end=None: None,

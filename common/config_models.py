@@ -600,8 +600,8 @@ class ModelConfig(BaseConfigModel):
             "value disables the budget. Overridable per request via\n"
             "reasoning_budget_tokens (aliases: reasoning_budget,\n"
             "thinking_budget, thinking_token_budget) or reasoning.max_tokens.\n"
-            "Requires a reasoning format: reasoning tags, Harmony or Muse\n"
-            "Glimmer."
+            "Requires a reasoning format: reasoning tags, Harmony, Muse\n"
+            "Glimmer or Inkling 2."
         ),
     )
     reasoning_budget_message: Optional[str] = Field(
@@ -637,6 +637,17 @@ class ModelConfig(BaseConfigModel):
             "Parse responses in the Muse Glimmer message format.\n"
             "Auto-detected from the model's special tokens by default; set to\n"
             "true or false to override. Setting 'tool_format: muse_glimmer' is\n"
+            "equivalent to setting this to true. When active, supersedes the\n"
+            "reasoning and tool format settings."
+        ),
+    )
+
+    inkling2: Optional[bool] = Field(
+        None,
+        description=(
+            "Parse responses in the Inkling 2 message format.\n"
+            "Auto-detected from the model's special tokens by default; set to\n"
+            "true or false to override. Setting 'tool_format: inkling2' is\n"
             "equivalent to setting this to true. When active, supersedes the\n"
             "reasoning and tool format settings."
         ),

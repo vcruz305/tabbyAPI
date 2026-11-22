@@ -233,6 +233,7 @@ class ModelLoadRequest(_WarnOnUnknownFields):
     )
     harmony: Optional[bool] = None
     muse_glimmer: Optional[bool] = None
+    inkling2: Optional[bool] = None
 
     # Non-config arguments
     draft_model: Optional[DraftModelLoadRequest] = None

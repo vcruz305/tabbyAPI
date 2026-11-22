@@ -229,6 +229,7 @@ def container(**kwargs):
     defaults = dict(
         harmony=False,
         muse_glimmer=False,
+        inkling2=False,
         reasoning=True,
         reasoning_start_token="<think>",
         reasoning_end_token="</think>",
@@ -269,7 +270,7 @@ class ResolveStartTests(unittest.TestCase):
         self.assertFalse(self.resolve("<think>partial", data, start_in_reasoning="never"))
 
     def test_channel_formats(self):
-        for flag in ("harmony", "muse_glimmer"):
+        for flag in ("harmony", "muse_glimmer", "inkling2"):
             self.assertTrue(self.resolve("x", self.reasoning_request(), **{flag: True}))
             self.assertFalse(self.resolve("x", continue_request(), **{flag: True}))
 

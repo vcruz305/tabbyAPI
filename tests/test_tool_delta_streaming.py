@@ -51,6 +51,7 @@ def make_mc(chunks, **overrides):
     mc = SimpleNamespace(
         harmony=False,
         muse_glimmer=False,
+        inkling2=False,
         tool_format="qwen3_coder",
         reasoning=True,
         reasoning_start_token=RS,
@@ -193,6 +194,31 @@ class StreamingDeltaWiringTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(frames[-1]["finish_reason"], "stop")
         self.assertFalse([f for f in frames if f.get("delta_tool_calls")])
+
+    async def test_inkling2_backend_streams_reasoning_content_and_tool_call(self):
+        # The inkling2 branch must select its parser and tool format, and the
+        # tool message must come out of the stream as a parsed tool call
+        chunks = [
+            "<|message_model|><|content_thinking|>Need the weather.<|end_message|>",
+            "<|message_model|><|content_text|>Checking.<|end_message|>",
+            "<|message_model|>get_weather<|content_invoke_tool_json|>",
+            '{"name":"get_weather","args":{"city":"Paris"}}<|end_message|>',
+        ]
+        mc = make_mc(pieces(chunks[0] + chunks[1] + chunks[2] + chunks[3]), harmony=False,
+                     muse_glimmer=False, inkling2=True, reasoning=False,
+                     reasoning_start_token=None, reasoning_end_token=None)
+
+        frames, result = await run_collector(mc, make_request())
+
+        reasoning = "".join(f.get("delta_reasoning_content", "") for f in frames)
+        content = "".join(f.get("delta_content", "") for f in frames)
+        self.assertEqual(reasoning, "Need the weather.")
+        self.assertEqual(content, "Checking.")
+        self.assertEqual(frames[-1]["finish_reason"], "tool_calls")
+        self.assertNotIn("<|", reasoning + content)
+        tool_calls = [tc for f in frames for tc in f.get("delta_tool_calls", [])]
+        self.assertEqual([tc["function"]["name"] for tc in tool_calls], ["get_weather"])
+        self.assertEqual(tool_calls[0]["function"]["arguments"], '{"city": "Paris"}')
 
     async def test_harmony_backend_unaffected(self):
         # regression: harmony/glimmer branches must define use_tool

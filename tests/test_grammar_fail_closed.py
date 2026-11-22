@@ -104,7 +104,7 @@ class GrammarParseErrorEndpointTests(unittest.IsolatedAsyncioTestCase):
             raise GrammarParseError("The JSON schema could not be compiled: Invalid grammar: boom")
 
         original_container = model.container
-        model.container = SimpleNamespace(reasoning=False, harmony=False, muse_glimmer=False)
+        model.container = SimpleNamespace(reasoning=False, harmony=False, muse_glimmer=False, inkling2=False)
         try:
             with patch.object(chat_completion, "_chat_stream_collector", collector):
                 with self.assertRaises(HTTPException) as raised:
@@ -165,7 +165,7 @@ class GrammarParseErrorStreamTests(unittest.IsolatedAsyncioTestCase):
             await gen_queue.put(error)
 
         original_container = model.container
-        model.container = SimpleNamespace(reasoning=False, harmony=False, muse_glimmer=False)
+        model.container = SimpleNamespace(reasoning=False, harmony=False, muse_glimmer=False, inkling2=False)
         try:
             with patch.object(chat_completion, "_chat_stream_collector", collector):
                 chunks = [

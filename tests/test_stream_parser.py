@@ -5,6 +5,7 @@ from endpoints.OAI.utils.stream_parser import (
     REASONING,
     GlimmerStreamParser,
     HarmonyStreamParser,
+    Inkling2StreamParser,
     TagStreamParser,
 )
 
@@ -487,6 +488,198 @@ class GlimmerToolcallFormatTests(unittest.TestCase):
 
     def test_no_invoke_block(self):
         self.assertEqual(self.parse(" to=ns.f<|message|>garbled<|eom|>"), [])
+
+
+class Inkling2StreamParserTests(unittest.TestCase):
+    # Generation begins at the first message header, so the text opens with
+    # <|message_model|>. <|content_model_end_sampling|> is a stop token and
+    # usually never appears in the text.
+
+    CAPTURED = (
+        "<|message_model|><|content_thinking|>The user asks for the capital of France... "
+        "Ensure no extra words.<|end_message|><|message_model|><|content_text|>Paris<|end_message|>"
+    )
+    TOOL_JSON = '{"name":"get_weather","args":{"city":"Paris"}}'
+
+    def test_captured_output(self):
+        out = collect(Inkling2StreamParser(), [self.CAPTURED])
+        self.assertEqual(
+            out["reasoning"],
+            "The user asks for the capital of France... Ensure no extra words.",
+        )
+        self.assertEqual(out["content"], "Paris")
+        self.assertEqual(out["tool"], "")
+
+    def test_one_character_at_a_time_matches_single_chunk(self):
+        whole = collect(Inkling2StreamParser(), [self.CAPTURED])
+        split = collect(Inkling2StreamParser(), list(self.CAPTURED))
+        self.assertEqual(split, whole)
+
+    def test_no_single_gate_token(self):
+        # Grammar gating needs one token that ends every header; Inkling 2 has
+        # none, so constrained requests are refused (see model.py)
+        self.assertIsNone(Inkling2StreamParser.gate_token)
+        self.assertEqual(HarmonyStreamParser.gate_token, "<|message|>")
+        self.assertEqual(GlimmerStreamParser.gate_token, "<|message|>")
+
+    def test_text_only_turn_without_thinking(self):
+        p = Inkling2StreamParser()
+        out = collect(p, ["<|message_model|><|content_text|>Hello ", "there.<|end_message|>"])
+        self.assertEqual(out, {"reasoning": "", "content": "Hello there.", "tool": ""})
+        self.assertFalse(p.in_reasoning or p.in_tool or p.in_content)
+
+    def test_tool_call_after_thinking(self):
+        out = collect(
+            Inkling2StreamParser(),
+            [
+                "<|message_model|><|content_thinking|>Need the weather.<|end_message|>",
+                "<|message_model|>get_weather<|content_invoke_tool_json|>",
+                self.TOOL_JSON + "<|end_message|>",
+            ],
+        )
+        self.assertEqual(out["reasoning"], "Need the weather.")
+        self.assertEqual(out["content"], "")
+        self.assertEqual(
+            out["tool"],
+            "get_weather<|content_invoke_tool_json|>" + self.TOOL_JSON + "<|end_message|>",
+        )
+
+    def test_two_tool_calls_stay_separate_messages(self):
+        second = '{"name":"get_time","args":{"tz":"CET"}}'
+        text = (
+            "<|message_model|>get_weather<|content_invoke_tool_json|>"
+            + self.TOOL_JSON
+            + "<|end_message|>"
+            "<|message_model|>get_time<|content_invoke_tool_json|>" + second + "<|end_message|>"
+        )
+        whole = collect(Inkling2StreamParser(), [text])
+        split = collect(Inkling2StreamParser(), list(text))
+        self.assertEqual(split, whole)
+        self.assertEqual(
+            whole["tool"],
+            "get_weather<|content_invoke_tool_json|>" + self.TOOL_JSON + "<|end_message|>"
+            "get_time<|content_invoke_tool_json|>" + second + "<|end_message|>",
+        )
+
+    def test_content_token_without_message_header(self):
+        out = collect(Inkling2StreamParser(), ["<|content_text|>Paris<|end_message|>"])
+        self.assertEqual(out, {"reasoning": "", "content": "Paris", "tool": ""})
+
+    def test_content_token_closes_open_body(self):
+        out = collect(
+            Inkling2StreamParser(),
+            ["<|content_thinking|>hmm<|content_text|>ok<|end_message|>"],
+        )
+        self.assertEqual(out, {"reasoning": "hmm", "content": "ok", "tool": ""})
+
+    def test_model_end_sampling_terminates_message(self):
+        out = collect(
+            Inkling2StreamParser(),
+            ["<|message_model|><|content_text|>Paris<|content_model_end_sampling|>"],
+        )
+        self.assertEqual(out, {"reasoning": "", "content": "Paris", "tool": ""})
+
+    def test_structural_tokens_never_leak(self):
+        p = Inkling2StreamParser()
+        out = collect(p, list(self.CAPTURED + self.CAPTURED))
+        for channel in ("reasoning", "content"):
+            self.assertNotIn("<|", out[channel])
+            self.assertNotIn("|>", out[channel])
+
+    def test_channel_properties_and_saw_tag(self):
+        p = Inkling2StreamParser()
+        self.assertFalse(p.in_reasoning or p.in_tool or p.in_content)
+        p.feed("<|message_model|><|content_thinking|>")
+        self.assertTrue(p.saw_tag)
+        self.assertTrue(p.in_reasoning)
+        p.feed("thinking")
+        self.assertFalse(p.saw_tag)
+        p.feed("<|end_message|><|message_model|><|content_text|>hello")
+        self.assertTrue(p.in_content)
+
+    def test_finish_closes_open_tool_message(self):
+        # max_new_tokens or a stop token can end generation inside a tool message
+        p = Inkling2StreamParser()
+        out = collect(
+            p, ["<|message_model|>get_weather<|content_invoke_tool_json|>" + self.TOOL_JSON]
+        )
+        self.assertEqual(
+            out["tool"],
+            "get_weather<|content_invoke_tool_json|>" + self.TOOL_JSON + "<|end_message|>",
+        )
+        self.assertFalse(p.in_tool)
+
+    def test_truncation_mid_header_discards_header(self):
+        out = collect(Inkling2StreamParser(), ["<|message_model|>get_wea"])
+        self.assertEqual(out, {"reasoning": "", "content": "", "tool": ""})
+
+
+class Inkling2ToolcallFormatTests(unittest.TestCase):
+    def parse(self, text):
+        from endpoints.OAI.utils.toolcall_formats.inkling2 import parse_toolcalls
+
+        return parse_toolcalls(text)
+
+    def test_parse_tool_call(self):
+        calls = self.parse(
+            'get_weather<|content_invoke_tool_json|>{"name":"get_weather","args":{"city":"Paris"}}'
+            "<|end_message|>"
+        )
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0].function.name, "get_weather")
+        self.assertEqual(calls[0].function.arguments, '{"city": "Paris"}')
+
+    def test_parallel_calls_across_messages(self):
+        calls = self.parse(
+            'a<|content_invoke_tool_json|>{"name":"a","args":{"x":1}}<|end_message|>'
+            'b<|content_invoke_tool_json|>{"name":"b","args":{"y":[2,3]}}<|end_message|>'
+        )
+        self.assertEqual([c.function.name for c in calls], ["a", "b"])
+        self.assertEqual(calls[0].function.arguments, '{"x": 1}')
+        self.assertEqual(calls[1].function.arguments, '{"y": [2, 3]}')
+
+    def test_no_args_is_empty_object(self):
+        calls = self.parse('ls<|content_invoke_tool_json|>{"name":"ls"}<|end_message|>')
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0].function.arguments, "{}")
+
+    def test_header_is_fallback_for_name(self):
+        calls = self.parse('ls<|content_invoke_tool_json|>{"args":{}}<|end_message|>')
+        self.assertEqual(calls[0].function.name, "ls")
+
+    def test_malformed_json_is_skipped(self):
+        self.assertEqual(
+            self.parse('f<|content_invoke_tool_json|>{"name":"f","args":{<|end_message|>'), []
+        )
+
+    def test_non_object_args_are_skipped(self):
+        self.assertEqual(
+            self.parse('f<|content_invoke_tool_json|>{"name":"f","args":"{}"}<|end_message|>'), []
+        )
+
+    def test_no_tool_message(self):
+        self.assertEqual(self.parse("garbled<|end_message|>"), [])
+
+
+class Inkling2DetectionTests(unittest.TestCase):
+    TOKENS = {
+        "<|message_model|>",
+        "<|content_thinking|>",
+        "<|content_text|>",
+        "<|end_message|>",
+    }
+
+    def test_detects_inkling2_from_template_tokens_and_architecture(self):
+        from endpoints.OAI.utils.tools import detect_tool_format
+
+        detection = detect_tool_format(
+            "{% for m in messages %}<|message_model|>{{ m.content }}<|end_message|>{% endfor %}"
+            "{% if tools %}tools{% endif %}",
+            lambda token: token in self.TOKENS,
+            "Inkling2LoopForConditionalGeneration",
+        )
+        self.assertEqual(detection.tool_format, "inkling2")
+        self.assertEqual(detection.ambiguous, [])
 
 
 class HarmonyToolcallFormatTests(unittest.TestCase):

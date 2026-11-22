@@ -304,6 +304,11 @@ class ChannelStreamParser:
     _TOKENS: List[str]
     _TOOL_END: str
 
+    # The token that ends every header, which grammar gating triggers on. None
+    # when the format has no single such token, and constrained output is then
+    # not wired to the message structure
+    gate_token: Optional[str] = "<|message|>"
+
     def _resolve_channel(self, header: str) -> str:
         """Map a message header to a channel."""
         raise NotImplementedError
@@ -484,6 +489,66 @@ class GlimmerStreamParser(ChannelStreamParser):
             return TOOL
         # to=user and messages without a recipient
         return CONTENT
+
+
+class Inkling2StreamParser(ChannelStreamParser):
+    """
+    Splits generated text in the Inkling 2 format into reasoning/content/tool
+    channels.
+
+    Inkling 2 has no single header-ending token (a content token opens each
+    body), so gate_token is None: grammar-constrained output is rejected for
+    these requests rather than attached to the wrong message.
+
+    Each message is a header, a typed content token that opens its body, and
+    a body that `<|end_message|>` closes. The content token decides the
+    channel and the header before a tool call is the function name:
+
+        <|message_model|><|content_thinking|>...reasoning...<|end_message|>
+        <|message_model|><|content_text|>...content...<|end_message|>
+        <|message_model|>get_weather<|content_invoke_tool_json|>{"name":...}<|end_message|>
+
+    A content token also opens a body when no `<|message_model|>` precedes
+    it, and it ends the previous body if one is still open. Tool messages are
+    parsed with the "inkling2" tool format.
+    """
+
+    _TOKENS = [
+        "<|message_model|>",
+        "<|content_thinking|>",
+        "<|content_text|>",
+        "<|content_tool_error|>",
+        "<|content_invoke_tool_text|>",
+        "<|content_invoke_tool_json|>",
+        "<|content_model_end_sampling|>",
+        "<|end_message|>",
+    ]
+    _TOOL_END = "<|end_message|>"
+    gate_token = None
+    _CHANNELS = {
+        "<|content_thinking|>": REASONING,
+        "<|content_text|>": CONTENT,
+        "<|content_tool_error|>": CONTENT,
+        "<|content_invoke_tool_text|>": CONTENT,
+        "<|content_invoke_tool_json|>": TOOL,
+    }
+
+    def _handle_token(self, token: str, events: list):
+        # Any structural token closes an open tool message, as in the base class
+        if self._state == self._BODY and self._channel == TOOL:
+            events.append((TOOL, self._TOOL_END))
+        header = self._header
+        self._state = self._HEADER
+        self._header = ""
+
+        if token in self._CHANNELS:
+            channel = self._CHANNELS[token]
+            if channel == TOOL:
+                events.append((TOOL, header + token))
+            self._channel = channel
+            self._state = self._BODY
+        # <|message_model|>, <|end_message|> and <|content_model_end_sampling|>
+        # only end the current message
 
 
 def _merge_events(events: List[Tuple[str, str]]) -> List[Tuple[str, str]]:

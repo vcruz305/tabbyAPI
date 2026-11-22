@@ -155,16 +155,36 @@ class PreparationTests(unittest.TestCase):
     def test_backend_negotiates_engine_and_excludes_other_reasoning_framing(self):
         ns = backend_symbols()
         mc = SimpleNamespace(tokenizer=Tokenizer(), reasoning_end_token="</think>",
-                             harmony=False, muse_glimmer=False)
+                             harmony=False, muse_glimmer=False, inkling2=False)
         for supported in (False, True):
             ns["AsyncJob"] = SimpleNamespace(set_token_budget=lambda *a, can_end=None: None) if supported else object
-            for framing in (None, "harmony", "muse_glimmer"):
+            for framing in (None, "harmony", "muse_glimmer", "inkling2"):
                 for initial in (False, True):
                     with self.subTest(supported=supported, framing=framing, initial=initial):
                         mc.harmony = framing == "harmony"
                         mc.muse_glimmer = framing == "muse_glimmer"
+                        mc.inkling2 = framing == "inkling2"
                         plan = ns["prepare_reasoning_budget"](mc, 3, "</think>", initial)
                         self.assertEqual(plan is not None, supported and framing is None and initial)
+
+
+class InklingBudgetInjectionTests(unittest.TestCase):
+    def test_forced_end_moves_to_content_message(self):
+        # The injected text must close the thinking message and open a text
+        # message, so the stream parser routes the rest of the turn to content
+        from endpoints.OAI.utils.stream_parser import Inkling2StreamParser
+
+        mc = SimpleNamespace(harmony=False, muse_glimmer=False, inkling2=True,
+                             reasoning=True, reasoning_start_token=None,
+                             reasoning_end_token=None)
+        injection = cc._reasoning_budget_injection(mc, "Wrap up.")
+        self.assertEqual(injection, "Wrap up.<|end_message|><|message_model|><|content_text|>")
+
+        parser = Inkling2StreamParser()
+        events = parser.feed(
+            "<|message_model|><|content_thinking|>long thought" + injection + "Paris"
+        )
+        self.assertEqual(events, [("reasoning", "long thoughtWrap up."), ("content", "Paris")])
 
 
 async def collect(mc, params, *, stream, initial=True):

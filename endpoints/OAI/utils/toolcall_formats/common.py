@@ -27,7 +27,7 @@ class FormatSignature:
     architectures: tuple = ()
     # Reasoning tags the models using this format are trained with, or None
     reasoning_tags: Optional[tuple] = None
-    # Tag-less formats (Harmony, Glimmer) that take over the whole stream
+    # Tag-less formats (Harmony, Glimmer, Inkling 2) that take over the whole stream
     structured: bool = False
 
 

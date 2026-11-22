@@ -59,6 +59,7 @@ from common.health import HealthManager
 from common.errors import (
     ContextLengthExceededError,
     EmptyPromptError,
+    GrammarParseError,
     LoopDetectedError,
     validate_context_requirements,
 )
@@ -250,6 +251,7 @@ class ExllamaV3Container:
     tool_format: Optional[str] = None
     harmony: bool = False
     muse_glimmer: bool = False
+    inkling2: bool = False
     reasoning_budget_tokens: Optional[int] = None
     reasoning_budget_message: Optional[str] = None
 
@@ -867,10 +869,50 @@ class ExllamaV3Container:
                     "settings in the model config; they will be ignored."
                 )
 
-        # Resolve "auto" reasoning tokens. Harmony and Glimmer carry reasoning
-        # in their message structure, so tags don't apply there
+        # Inkling 2 message format. Same approach as Glimmer: the message
+        # structure is baked into the special tokens, so auto-detect unless
+        # overridden in config, and it stays off when Harmony or Glimmer is on
+        inkling = kwargs.get("inkling2")
+        if self.tool_format == "inkling2":
+            # Inkling 2 isn't a tag-based tool format; selecting it as one
+            # enables full Inkling 2 parsing
+            if inkling is False:
+                xlogger.warning(
+                    "tool_format: inkling2 has no effect when inkling2 is set to "
+                    "false; tool calls will not be parsed."
+                )
+            else:
+                inkling = True
+        if inkling is None:
+            inkling = not self.harmony and not self.muse_glimmer and all(
+                self.tokenizer.single_id(token) is not None
+                for token in (
+                    "<|message_model|>",
+                    "<|content_thinking|>",
+                    "<|content_text|>",
+                    "<|end_message|>",
+                )
+            )
+        if inkling and (self.harmony or self.muse_glimmer):
+            other = "harmony" if self.harmony else "muse_glimmer"
+            xlogger.warning(
+                f"Both {other} and inkling2 are enabled; using {other} "
+                "and ignoring inkling2."
+            )
+            inkling = False
+        self.inkling2 = bool(inkling)
+        if self.inkling2:
+            xlogger.info("Using the Inkling 2 format for reasoning and tool call parsing.")
+            if self.reasoning_explicit or (self.tool_format and self.tool_format != "inkling2"):
+                xlogger.warning(
+                    "Inkling 2 supersedes the reasoning and tool format settings "
+                    "in the model config; they will be ignored."
+                )
+
+        # Resolve "auto" reasoning tokens. Harmony, Glimmer and Inkling 2 carry
+        # reasoning in their message structure, so tags don't apply there
         reasoning_evidence = "config"
-        if self.harmony or self.muse_glimmer:
+        if self.harmony or self.muse_glimmer or self.inkling2:
             self.reasoning_start_token = None
             self.reasoning_end_token = None
         elif self.reasoning and not self.reasoning_explicit:
@@ -892,6 +934,8 @@ class ExllamaV3Container:
             summary = "Harmony message format"
         elif self.muse_glimmer:
             summary = "Muse Glimmer message format"
+        elif self.inkling2:
+            summary = "Inkling 2 message format"
         else:
             parts = []
             if self.tool_format:
@@ -2082,7 +2126,8 @@ class ExllamaV3Container:
             self.tokenizer,
             max_tokens,
             text,
-            initial_reasoning=initial_reasoning and not self.harmony and not self.muse_glimmer,
+            initial_reasoning=initial_reasoning
+            and not (self.harmony or self.muse_glimmer or self.inkling2),
             end_token=self.reasoning_end_token,
             supported=supports_native_reasoning_budget(AsyncJob, natural_only=max_tokens is None),
             parser=parser,
@@ -2485,8 +2530,16 @@ class ExllamaV3Container:
         trigger_token_id = None
         constrained = params.json_schema or params.regex_pattern or params.grammar_string
         if constrained and channel_parser:
+            if channel_parser.gate_token is None:
+                # Inkling 2 opens each body with one of several content tokens,
+                # and the gate takes one. Refuse rather than constrain the
+                # wrong message (reasoning, text or tool body)
+                raise GrammarParseError(
+                    "Grammar-constrained output (json_schema, response_format, regex or "
+                    "forced tool_choice) is not supported with the Inkling 2 message format."
+                )
             grammar_handler.gate = MessageGate(
-                message_token=self.tokenizer.single_id("<|message|>"),
+                message_token=self.tokenizer.single_id(channel_parser.gate_token),
                 boundary_tokens=frozenset(
                     self.tokenizer.single_id(token) for token in channel_parser.structural_tokens
                 ),

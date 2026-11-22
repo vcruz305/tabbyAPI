@@ -194,7 +194,7 @@ class LoopDetectErrorTests(unittest.IsolatedAsyncioTestCase):
             return LoopDetectedError(LOOP_MESSAGE)
 
         original_container = model.container
-        model.container = SimpleNamespace(reasoning=False, harmony=False, muse_glimmer=False)
+        model.container = SimpleNamespace(reasoning=False, harmony=False, muse_glimmer=False, inkling2=False)
         try:
             with patch.object(chat_completion, "_chat_stream_collector", collector):
                 with self.assertRaises(LoopDetectedHTTPException) as raised:
@@ -217,7 +217,7 @@ class LoopDetectErrorTests(unittest.IsolatedAsyncioTestCase):
             await gen_queue.put(LoopDetectedError(LOOP_MESSAGE))
 
         original_container = model.container
-        model.container = SimpleNamespace(reasoning=False, harmony=False, muse_glimmer=False)
+        model.container = SimpleNamespace(reasoning=False, harmony=False, muse_glimmer=False, inkling2=False)
         try:
             with patch.object(chat_completion, "_chat_stream_collector", collector):
                 chunks = [
