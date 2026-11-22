@@ -7,7 +7,7 @@ import re
 from fastapi.testclient import TestClient
 from loguru import logger
 
-from common import auth
+from common import auth, config_models
 from common.sampling import UNSUPPORTED_PARAMS, BaseSamplerRequest
 from common.tabby_config import config
 from endpoints.OAI.types.chat_completion import ChatCompletionRequest
@@ -127,8 +127,9 @@ def test_ui_disabled(monkeypatch):
     assert client.get("/ui", follow_redirects=False).status_code == 404
 
 
-def startup_lines(monkeypatch, admin_key, disable_auth):
+def startup_lines(monkeypatch, admin_key, disable_auth, log_auth_keys=True):
     monkeypatch.setattr(config.network, "web_ui", True)
+    monkeypatch.setattr(config.logging, "log_auth_keys", log_auth_keys)
     monkeypatch.setattr(auth, "DISABLE_AUTH", disable_auth)
     monkeypatch.setattr(auth, "AUTH_KEYS", auth.AuthKeys(api_key="api", admin_key=admin_key))
 
@@ -148,6 +149,16 @@ def test_startup_link_carries_admin_key(monkeypatch):
     assert lines == [
         "Chat client at http://127.0.0.1:5000/ui/#key=se%2Fcret%20key\n",
         "Server status and model loading at http://127.0.0.1:5000/ui/status#key=se%2Fcret%20key\n",
+    ]
+
+
+def test_startup_link_omits_admin_key_by_default(monkeypatch):
+    # log_auth_keys is off by default in this fork: no key in the console, links included
+    assert config_models.LoggingConfig().log_auth_keys is False
+    lines = startup_lines(monkeypatch, "se/cret key", disable_auth=False, log_auth_keys=False)
+    assert lines == [
+        "Chat client at http://127.0.0.1:5000/ui/\n",
+        "Server status and model loading at http://127.0.0.1:5000/ui/status\n",
     ]
 
 
